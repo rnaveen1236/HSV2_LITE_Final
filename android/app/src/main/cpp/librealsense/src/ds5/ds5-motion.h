@@ -7,6 +7,9 @@
 
 namespace librealsense
 {
+    class ds5_motion;
+
+    ds5_motion* get_active_d455_vio_instance();
     // Enforce complile-time verification of all the assigned FPS profiles
     enum class IMU_OUTPUT_DATA_RATES : uint16_t
     {
@@ -383,6 +386,7 @@ namespace librealsense
 
         ds::imu_intrinsic get_intrinsic(rs2_stream);
         rs2_extrinsics get_extrinsic(rs2_stream);       // The extrinsic defined as Depth->Stream rigid-body transfom.
+
         const std::vector<uint8_t> get_fisheye_calib_raw();
         float3x3 imu_to_depth_alignment() { return (*_calib_parser)->imu_to_depth_alignment(); }
     private:
@@ -406,6 +410,13 @@ namespace librealsense
                    const platform::backend_device_group& group);
 
         rs2_motion_device_intrinsic get_motion_intrinsics(rs2_stream) const;
+
+        bool get_vio_depth_to_imu_extrinsics(rs2_extrinsics& out) const;
+
+        bool get_vio_extrinsics(rs2_extrinsics* color_to_accel,
+                                rs2_extrinsics* color_to_gyro) const;
+
+        static ds5_motion* get_active_vio_instance();
 
         std::shared_ptr<auto_exposure_mechanism> register_auto_exposure_options(synthetic_sensor* ep,
                                                                                 const platform::extension_unit* fisheye_xu);

@@ -11,6 +11,28 @@
 
 namespace librealsense
 {
+    namespace
+    {
+        ds5_color* g_active_d455_vio_color_instance = nullptr;
+    }
+
+    ds5_color* get_active_d455_vio_color_instance()
+    {
+        return g_active_d455_vio_color_instance;
+    }
+
+    bool ds5_color::get_vio_color_to_depth_extrinsics(rs2_extrinsics& out) const
+    {
+        if (!_color_stream || !_depth_stream)
+            return false;
+
+        return environment::get_instance()
+            .get_extrinsics_graph()
+            .try_fetch_extrinsics(
+                *_color_stream,
+                *_depth_stream,
+                &out);
+    }
     std::map<uint32_t, rs2_format> ds5_color_fourcc_to_rs2_format = {
         {rs_fourcc('Y','U','Y','2'), RS2_FORMAT_YUYV},
         {rs_fourcc('Y','U','Y','V'), RS2_FORMAT_YUYV},
@@ -32,6 +54,7 @@ namespace librealsense
           _color_stream(new stream(RS2_STREAM_COLOR)),
           _separate_color(true)
     {
+        g_active_d455_vio_color_instance = this;
         create_color_device(ctx, group);
         init();
     }

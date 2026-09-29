@@ -1,0 +1,1408 @@
+import 'dart:async';
+import 'dart:convert';
+import 'dart:math' as math;
+
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:provider/provider.dart';
+import '../providers/app_state.dart';
+
+class Stage2VisualizationScreen extends StatefulWidget {
+  const Stage2VisualizationScreen({super.key});
+
+  @override
+  State<Stage2VisualizationScreen> createState() =>
+      _Stage2VisualizationScreenState();
+}
+
+class _Stage2VisualizationScreenState
+    extends State<Stage2VisualizationScreen> {
+  static const MethodChannel _commandChannel = MethodChannel('com.hsv2/command');
+
+  Timer? _timer;
+
+  bool _running = false;
+  bool _loading = false;
+
+  double _processingMs = 0.0;
+  int _validPoints = 0;
+  int _voxelCount = 0;
+  int _decimation = 2;
+  double _voxelSizeM = 0.020;
+
+  List<_Point3D> _points = <_Point3D>[];
+  List<_Voxel3D> _voxels = <_Voxel3D>[];
+
+  // Stage 2.6 RGB projection parameters.
+  int _rgbWidth = 640;
+  int _rgbHeight = 480;
+  double _rgbFx = 0.0;
+  double _rgbFy = 0.0;
+  double _rgbCx = 320.0;
+  double _rgbCy = 240.0;
+
+  double _yaw = 0.55;
+  double _pitch = -0.35;
+  double _zoom = 1.0;
+
+  Offset? _lastPanPosition;
+  double _lastScale = 1.0;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _running = true;
+
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+
+      final appState =
+          Provider.of<AppState>(
+        context,
+        listen: false,
+      );
+
+      if (appState.textureId == null) {
+        appState.initNativeTexture();
+      }
+    });
+
+    _commandChannel.invokeMethod(
+      'setStage',
+      <String, dynamic>{'stage': 2},
+    );
+
+    _timer = Timer.periodic(
+      const Duration(milliseconds: 200),
+      (_) => _loadStage2Data(),
+    );
+
+    _loadStage2Data();
+  }
+
+  @override
+  void dispose() {
+    _timer?.cancel();
+
+    _commandChannel.invokeMethod(
+      'setStage',
+      <String, dynamic>{'stage': 1},
+    );
+
+    super.dispose();
+  }
+
+  Future<void> _loadStage2Data() async {
+    if (!_running || _loading) {
+      return;
+    }
+
+    _loading = true;
+
+    try {
+      final raw = await _commandChannel.invokeMethod<dynamic>(
+        'getStage2Visualization',
+      );
+
+      if (raw == null) {
+        return;
+      }
+
+      final Map<String, dynamic> data =
+          jsonDecode(raw.toString()) as Map<String, dynamic>;
+
+      if (!mounted) {
+        return;
+      }
+
+      final pointsRaw = data['points'];
+      final voxelsRaw = data['voxels'];
+
+      final List<_Point3D> points = <_Point3D>[];
+      if (pointsRaw is List) {
+        for (final item in pointsRaw) {
+          if (item is List && item.length >= 3) {
+            final x = (item[0] as num?)?.toDouble();
+            final y = (item[1] as num?)?.toDouble();
+            final z = (item[2] as num?)?.toDouble();
+
+            if (x != null && y != null && z != null) {
+              points.add(_Point3D(x, y, z));
+            }
+          }
+        }
+      }
+
+      final List<_Voxel3D> voxels = <_Voxel3D>[];
+      if (voxelsRaw is List) {
+        for (final item in voxelsRaw) {
+          if (item is List && item.length >= 3) {
+            final x = (item[0] as num?)?.toInt();
+            final y = (item[1] as num?)?.toInt();
+            final z = (item[2] as num?)?.toInt();
+
+            if (x != null && y != null && z != null) {
+              voxels.add(_Voxel3D(x, y, z));
+            }
+          }
+        }
+      }
+
+      setState(() {
+        _processingMs =
+            (data['processingMs'] as num?)?.toDouble() ?? 0.0;
+
+        _validPoints =
+            (data['validPoints'] as num?)?.toInt() ?? 0;
+
+        _voxelCount =
+            (data['voxelCount'] as num?)?.toInt() ?? 0;
+
+        _decimation =
+            (data['decimation'] as num?)?.toInt() ?? 2;
+
+        _voxelSizeM =
+            (data['voxelSizeM'] as num?)?.toDouble() ?? 0.020;
+
+        _rgbWidth =
+            (data['rgbWidth'] as num?)?.toInt() ?? 640;
+
+        _rgbHeight =
+            (data['rgbHeight'] as num?)?.toInt() ?? 480;
+
+        _rgbFx =
+            (data['rgbFx'] as num?)?.toDouble() ?? 0.0;
+
+        _rgbFy =
+            (data['rgbFy'] as num?)?.toDouble() ?? 0.0;
+
+        _rgbCx =
+            (data['rgbCx'] as num?)?.toDouble() ?? 320.0;
+
+        _rgbCy =
+            (data['rgbCy'] as num?)?.toDouble() ?? 240.0;
+
+        _points = points;
+        _voxels = voxels;
+      });
+    } catch (e) {
+      debugPrint('Stage 2 visualization error: $e');
+    } finally {
+      _loading = false;
+    }
+  }
+
+  void _resetView() {
+    setState(() {
+      _yaw = 0.55;
+      _pitch = -0.35;
+      _zoom = 1.0;
+    });
+  }
+
+  void _handleScaleStart(ScaleStartDetails details) {
+    _lastPanPosition = details.focalPoint;
+    _lastScale = 1.0;
+  }
+
+  void _handleScaleUpdate(ScaleUpdateDetails details) {
+    if (details.pointerCount >= 2) {
+      final scaleDelta = details.scale / _lastScale;
+
+      setState(() {
+        _zoom = (_zoom * scaleDelta).clamp(0.45, 3.5);
+      });
+
+      _lastScale = details.scale;
+      return;
+    }
+
+    if (_lastPanPosition == null) {
+      _lastPanPosition = details.focalPoint;
+      return;
+    }
+
+    final delta = details.focalPoint - _lastPanPosition!;
+
+    setState(() {
+      _yaw += delta.dx * 0.010;
+      _pitch += delta.dy * 0.010;
+
+      _pitch = _pitch.clamp(-1.45, 1.45);
+    });
+
+    _lastPanPosition = details.focalPoint;
+  }
+
+  void _handleScaleEnd(ScaleEndDetails details) {
+    _lastPanPosition = null;
+    _lastScale = 1.0;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final hasData = _points.isNotEmpty || _voxels.isNotEmpty;
+
+    return Scaffold(
+      backgroundColor: const Color(0xFF080B10),
+      appBar: AppBar(
+        backgroundColor: const Color(0xFF1A202B),
+        foregroundColor: Colors.white,
+        title: const Text(
+          'Stage 2 Visualization',
+          style: TextStyle(
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+        actions: [
+          IconButton(
+            tooltip: 'Reset 3D View',
+            onPressed: _resetView,
+            icon: const Icon(Icons.threesixty),
+          ),
+        ],
+      ),
+      body: SafeArea(
+        child: Column(
+          children: [
+            _buildMetrics(),
+            Expanded(
+              child: ListView(
+                padding: const EdgeInsets.fromLTRB(16, 8, 16, 24),
+                children: [
+                  _buildSectionTitle(
+                    'RGB + 3D / VOXEL OVERLAY',
+                    Icons.camera_alt_outlined,
+                  ),
+                  const SizedBox(height: 8),
+                  _buildRgbOverlay(),
+                  const SizedBox(height: 18),
+                  _buildSectionTitle(
+                    '3D POINT CLOUD',
+                    Icons.scatter_plot_outlined,
+                  ),
+                  const SizedBox(height: 8),
+                  _build3DPanel(
+                    child: _PointCloud3DView(
+                      points: _points,
+                      yaw: _yaw,
+                      pitch: _pitch,
+                      zoom: _zoom,
+                    ),
+                  ),
+                  const SizedBox(height: 18),
+                  _buildSectionTitle(
+                    '3D SINGLE-FRAME VOXEL GRID',
+                    Icons.grid_3x3,
+                  ),
+                  const SizedBox(height: 8),
+                  _build3DPanel(
+                    child: _Voxel3DView(
+                      voxels: _voxels,
+                      voxelSize: _voxelSizeM,
+                      yaw: _yaw,
+                      pitch: _pitch,
+                      zoom: _zoom,
+                    ),
+                  ),
+                  const SizedBox(height: 14),
+                  _buildControls(hasData),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
+  Widget _buildRgbOverlay() {
+    final textureId =
+        context.watch<AppState>().textureId;
+
+    return Container(
+      width: double.infinity,
+      decoration: BoxDecoration(
+        color: const Color(0xFF05080D),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xFF28313D),
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: AspectRatio(
+        aspectRatio: 4 / 3,
+        child: textureId == null
+            ? const Center(
+                child: Text(
+                  'WAITING FOR RGB TEXTURE',
+                  style: TextStyle(
+                    color: Colors.white54,
+                    fontSize: 12,
+                    fontWeight: FontWeight.bold,
+                  ),
+                ),
+              )
+            : Stack(
+                fit: StackFit.expand,
+                children: [
+                  Texture(
+                    textureId: textureId,
+                  ),
+                  IgnorePointer(
+                    child: CustomPaint(
+                      painter: _RgbStage2OverlayPainter(
+                        points: _points,
+                        voxels: _voxels,
+                        rgbWidth: _rgbWidth,
+                        rgbHeight: _rgbHeight,
+                        fx: _rgbFx,
+                        fy: _rgbFy,
+                        cx: _rgbCx,
+                        cy: _rgbCy,
+                        voxelSize: _voxelSizeM,
+                      ),
+                    ),
+                  ),
+                  Positioned(
+                    left: 10,
+                    top: 10,
+                    child: Container(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 8,
+                        vertical: 5,
+                      ),
+                      decoration: BoxDecoration(
+                        color: Colors.black.withOpacity(0.65),
+                        borderRadius: BorderRadius.circular(6),
+                      ),
+                      child: const Text(
+                        'LIVE RGB + 3D/Voxel',
+                        style: TextStyle(
+                          color: Colors.white,
+                          fontSize: 10,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 0.5,
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              ),
+      ),
+    );
+  }
+
+  Widget _buildMetrics() {
+    return Container(
+      padding: const EdgeInsets.fromLTRB(16, 12, 16, 10),
+      color: const Color(0xFF101720),
+      child: Row(
+        children: [
+          Expanded(
+            child: _metric(
+              'POINTS',
+              _validPoints.toString(),
+            ),
+          ),
+          Expanded(
+            child: _metric(
+              'VOXELS',
+              _voxelCount.toString(),
+            ),
+          ),
+          Expanded(
+            child: _metric(
+              'PROCESSING',
+              '${_processingMs.toStringAsFixed(1)} ms',
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _metric(String title, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white54,
+            fontSize: 10,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 1.0,
+          ),
+        ),
+        const SizedBox(height: 3),
+        Text(
+          value,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 15,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _buildSectionTitle(String title, IconData icon) {
+    return Row(
+      children: [
+        Icon(
+          icon,
+          color: Colors.lightBlueAccent,
+          size: 18,
+        ),
+        const SizedBox(width: 7),
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 15,
+            fontWeight: FontWeight.bold,
+            letterSpacing: 0.8,
+          ),
+        ),
+      ],
+    );
+  }
+
+  Widget _build3DPanel({required Widget child}) {
+    return Container(
+      height: 330,
+      decoration: BoxDecoration(
+        color: const Color(0xFF05080D),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(
+          color: const Color(0xFF28313D),
+        ),
+      ),
+      clipBehavior: Clip.antiAlias,
+      child: GestureDetector(
+        behavior: HitTestBehavior.opaque,
+        onScaleStart: _handleScaleStart,
+        onScaleUpdate: _handleScaleUpdate,
+        onScaleEnd: _handleScaleEnd,
+        child: child,
+      ),
+    );
+  }
+
+  Widget _buildControls(bool hasData) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: const Color(0xFF121A23),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(
+          color: const Color(0xFF26323F),
+        ),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              const Icon(
+                Icons.touch_app_outlined,
+                color: Colors.lightBlueAccent,
+                size: 18,
+              ),
+              const SizedBox(width: 7),
+              const Expanded(
+                child: Text(
+                  'DRAG TO ROTATE  •  PINCH TO ZOOM',
+                  style: TextStyle(
+                    color: Colors.white,
+                    fontSize: 11,
+                    fontWeight: FontWeight.bold,
+                    letterSpacing: 0.5,
+                  ),
+                ),
+              ),
+              TextButton(
+                onPressed: _resetView,
+                child: const Text('RESET'),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          Row(
+            children: [
+              _configItem(
+                'Decimation',
+                '${_decimation}×',
+              ),
+              const SizedBox(width: 28),
+              _configItem(
+                'Voxel',
+                '${(_voxelSizeM * 1000).toStringAsFixed(0)} mm',
+              ),
+              const Spacer(),
+              Text(
+                hasData ? 'LIVE' : 'WAITING',
+                style: TextStyle(
+                  color: hasData
+                      ? Colors.greenAccent
+                      : Colors.orangeAccent,
+                  fontSize: 12,
+                  fontWeight: FontWeight.bold,
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _configItem(String title, String value) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Text(
+          title,
+          style: const TextStyle(
+            color: Colors.white54,
+            fontSize: 10,
+          ),
+        ),
+        const SizedBox(height: 2),
+        Text(
+          value,
+          style: const TextStyle(
+            color: Colors.white,
+            fontSize: 13,
+            fontWeight: FontWeight.bold,
+          ),
+        ),
+      ],
+    );
+  }
+}
+
+class _RgbStage2OverlayPainter extends CustomPainter {
+  final List<_Point3D> points;
+  final List<_Voxel3D> voxels;
+
+  final int rgbWidth;
+  final int rgbHeight;
+
+  final double fx;
+  final double fy;
+  final double cx;
+  final double cy;
+
+  final double voxelSize;
+
+  const _RgbStage2OverlayPainter({
+    required this.points,
+    required this.voxels,
+    required this.rgbWidth,
+    required this.rgbHeight,
+    required this.fx,
+    required this.fy,
+    required this.cx,
+    required this.cy,
+    required this.voxelSize,
+  });
+
+  Offset? _project(
+    double x,
+    double y,
+    double z,
+    Size size,
+  ) {
+    if (!z.isFinite ||
+        z <= 0.10 ||
+        fx <= 0.0 ||
+        fy <= 0.0 ||
+        rgbWidth <= 0 ||
+        rgbHeight <= 0) {
+      return null;
+    }
+
+    final u = fx * x / z + cx;
+    final v = fy * y / z + cy;
+
+    if (!u.isFinite ||
+        !v.isFinite ||
+        u < 0.0 ||
+        u >= rgbWidth ||
+        v < 0.0 ||
+        v >= rgbHeight) {
+      return null;
+    }
+
+    return Offset(
+      u * size.width / rgbWidth,
+      v * size.height / rgbHeight,
+    );
+  }
+
+  double _pointRadius(double z) {
+    if (z <= 0.5) return 2.2;
+    if (z >= 5.0) return 1.0;
+
+    return (2.2 - (z - 0.5) * 0.30).clamp(1.0, 2.2);
+  }
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    // ------------------------------------------------------------
+    // Stage 2.6
+    // Sparse 3D point projection onto the live RGB frame.
+    //
+    // The native Stage 2 result is already bounded to 3000 points.
+    // We intentionally render only every 2nd point here so the RGB
+    // image remains visible instead of becoming a dense point cloud.
+    // ------------------------------------------------------------
+
+    final pointPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true
+      ..color = Colors.cyanAccent.withOpacity(0.72);
+
+    for (int i = 0; i < points.length; i += 2) {
+      final point = points[i];
+
+      final projected = _project(
+        point.x,
+        point.y,
+        point.z,
+        size,
+      );
+
+      if (projected == null) {
+        continue;
+      }
+
+      canvas.drawCircle(
+        projected,
+        _pointRadius(point.z),
+        pointPaint,
+      );
+    }
+
+    // ------------------------------------------------------------
+    // Stage 2.6
+    // Sparse voxel occupancy overlay.
+    //
+    // Do not draw a projected rectangle for every voxel. At 20 mm
+    // voxel size this produces heavy overlap on the RGB image.
+    // Instead, render a small occupancy marker at the voxel centre.
+    // ------------------------------------------------------------
+
+    final voxelPaint = Paint()
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 1.0
+      ..isAntiAlias = true
+      ..color = Colors.amberAccent.withOpacity(0.78);
+
+    final voxelFillPaint = Paint()
+      ..style = PaintingStyle.fill
+      ..isAntiAlias = true
+      ..color = Colors.amberAccent.withOpacity(0.20);
+
+    // Render approximately 1/4 of the bounded voxel sample.
+    for (int i = 0; i < voxels.length; i += 4) {
+      final voxel = voxels[i];
+
+      final x =
+          (voxel.x + 0.5) * voxelSize;
+      final y =
+          (voxel.y + 0.5) * voxelSize;
+      final z =
+          (voxel.z + 0.5) * voxelSize;
+
+      final projected = _project(
+        x,
+        y,
+        z,
+        size,
+      );
+
+      if (projected == null) {
+        continue;
+      }
+
+      // Small fixed marker keeps the RGB scene readable.
+      const double marker = 2.5;
+
+      final rect = Rect.fromCenter(
+        center: projected,
+        width: marker * 2,
+        height: marker * 2,
+      );
+
+      canvas.drawRect(
+        rect,
+        voxelFillPaint,
+      );
+
+      canvas.drawRect(
+        rect,
+        voxelPaint,
+      );
+    }
+  }
+
+  @override
+  bool shouldRepaint(
+    covariant _RgbStage2OverlayPainter oldDelegate,
+  ) {
+    return oldDelegate.points != points ||
+        oldDelegate.voxels != voxels ||
+        oldDelegate.rgbWidth != rgbWidth ||
+        oldDelegate.rgbHeight != rgbHeight ||
+        oldDelegate.fx != fx ||
+        oldDelegate.fy != fy ||
+        oldDelegate.cx != cx ||
+        oldDelegate.cy != cy ||
+        oldDelegate.voxelSize != voxelSize;
+  }
+}
+
+class _Point3D {
+  final double x;
+  final double y;
+  final double z;
+
+  const _Point3D(this.x, this.y, this.z);
+}
+
+class _Voxel3D {
+  final int x;
+  final int y;
+  final int z;
+
+  const _Voxel3D(this.x, this.y, this.z);
+}
+
+class _ProjectedPoint {
+  final Offset offset;
+  final double depth;
+
+  const _ProjectedPoint(this.offset, this.depth);
+}
+
+class _Camera3D {
+  final double yaw;
+  final double pitch;
+  final double zoom;
+  final Size size;
+
+  const _Camera3D({
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+    required this.size,
+  });
+
+  _ProjectedPoint? project(
+    double x,
+    double y,
+    double z,
+  ) {
+    // Camera-space transform.
+    final cy = math.cos(yaw);
+    final sy = math.sin(yaw);
+
+    final cp = math.cos(pitch);
+    final sp = math.sin(pitch);
+
+    // Rotate around world Y.
+    final rx = x * cy - z * sy;
+    final rz = x * sy + z * cy;
+
+    // Rotate around world X.
+    final ry = y * cp - rz * sp;
+    final depth = y * sp + rz * cp;
+
+    // Move the camera backwards so the complete cloud is visible.
+    final cameraDistance = 2.8;
+
+    final perspectiveDenominator =
+        cameraDistance + depth;
+
+    if (perspectiveDenominator <= 0.15) {
+      return null;
+    }
+
+    final focal = math.min(size.width, size.height) *
+        0.72 *
+        zoom;
+
+    final sx =
+        size.width / 2 +
+        rx * focal / perspectiveDenominator;
+
+    final syScreen =
+        size.height / 2 -
+        ry * focal / perspectiveDenominator;
+
+    return _ProjectedPoint(
+      Offset(sx, syScreen),
+      depth,
+    );
+  }
+}
+
+class _PointCloud3DView extends StatelessWidget {
+  final List<_Point3D> points;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+
+  const _PointCloud3DView({
+    required this.points,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _PointCloud3DPainter(
+        points: points,
+        yaw: yaw,
+        pitch: pitch,
+        zoom: zoom,
+      ),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _PointCloud3DPainter extends CustomPainter {
+  final List<_Point3D> points;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+
+  const _PointCloud3DPainter({
+    required this.points,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    _drawBackground(canvas, size);
+
+    final camera = _Camera3D(
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
+      size: size,
+    );
+
+    _drawAxes(canvas, camera);
+
+    final projected = <_ProjectedPoint>[];
+
+    for (final point in points) {
+      final p = camera.project(
+        point.x,
+        point.y,
+        point.z,
+      );
+
+      if (p != null &&
+          p.offset.dx >= -20 &&
+          p.offset.dx <= size.width + 20 &&
+          p.offset.dy >= -20 &&
+          p.offset.dy <= size.height + 20) {
+        projected.add(p);
+      }
+    }
+
+    // Painter's algorithm: far points first.
+    projected.sort(
+      (a, b) => a.depth.compareTo(b.depth),
+    );
+
+    final paint = Paint()
+      ..style = PaintingStyle.fill
+      ..color = Colors.lightBlueAccent;
+
+    for (final point in projected) {
+      final radius =
+          (2.2 + (point.depth + 1.0) * 0.35)
+              .clamp(1.3, 3.0);
+
+      canvas.drawCircle(
+        point.offset,
+        radius.toDouble(),
+        paint,
+      );
+    }
+
+    _drawCenterMarker(canvas, size);
+  }
+
+  void _drawBackground(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = const Color(0xFF05080D)
+      ..style = PaintingStyle.fill;
+
+    canvas.drawRect(
+      Offset.zero & size,
+      paint,
+    );
+  }
+
+  void _drawAxes(Canvas canvas, _Camera3D camera) {
+    final origin = camera.project(0, 0, 0);
+
+    if (origin == null) {
+      return;
+    }
+
+    final axisPaintX = Paint()
+      ..color = Colors.redAccent
+      ..strokeWidth = 1.5;
+
+    final axisPaintY = Paint()
+      ..color = Colors.greenAccent
+      ..strokeWidth = 1.5;
+
+    final axisPaintZ = Paint()
+      ..color = Colors.blueAccent
+      ..strokeWidth = 1.5;
+
+    _drawAxis(
+      canvas,
+      camera,
+      0,
+      0,
+      0,
+      1.0,
+      0,
+      0,
+      axisPaintX,
+      'X',
+    );
+
+    _drawAxis(
+      canvas,
+      camera,
+      0,
+      0,
+      0,
+      0,
+      1.0,
+      0,
+      axisPaintY,
+      'Y',
+    );
+
+    _drawAxis(
+      canvas,
+      camera,
+      0,
+      0,
+      0,
+      0,
+      0,
+      1.0,
+      axisPaintZ,
+      'Z',
+    );
+  }
+
+  void _drawAxis(
+    Canvas canvas,
+    _Camera3D camera,
+    double x1,
+    double y1,
+    double z1,
+    double x2,
+    double y2,
+    double z2,
+    Paint paint,
+    String label,
+  ) {
+    final p1 = camera.project(x1, y1, z1);
+    final p2 = camera.project(x2, y2, z2);
+
+    if (p1 == null || p2 == null) {
+      return;
+    }
+
+    canvas.drawLine(
+      p1.offset,
+      p2.offset,
+      paint,
+    );
+
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: paint.color,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+
+    textPainter.paint(
+      canvas,
+      p2.offset + const Offset(5, -5),
+    );
+  }
+
+  void _drawCenterMarker(Canvas canvas, Size size) {
+    final paint = Paint()
+      ..color = Colors.white24
+      ..strokeWidth = 1;
+
+    canvas.drawLine(
+      Offset(size.width / 2 - 8, size.height / 2),
+      Offset(size.width / 2 + 8, size.height / 2),
+      paint,
+    );
+
+    canvas.drawLine(
+      Offset(size.width / 2, size.height / 2 - 8),
+      Offset(size.width / 2, size.height / 2 + 8),
+      paint,
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _PointCloud3DPainter oldDelegate) {
+    return oldDelegate.points != points ||
+        oldDelegate.yaw != yaw ||
+        oldDelegate.pitch != pitch ||
+        oldDelegate.zoom != zoom;
+  }
+}
+
+class _Voxel3DView extends StatelessWidget {
+  final List<_Voxel3D> voxels;
+  final double voxelSize;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+
+  const _Voxel3DView({
+    required this.voxels,
+    required this.voxelSize,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: _Voxel3DPainter(
+        voxels: voxels,
+        voxelSize: voxelSize,
+        yaw: yaw,
+        pitch: pitch,
+        zoom: zoom,
+      ),
+      child: const SizedBox.expand(),
+    );
+  }
+}
+
+class _Voxel3DPainter extends CustomPainter {
+  final List<_Voxel3D> voxels;
+  final double voxelSize;
+  final double yaw;
+  final double pitch;
+  final double zoom;
+
+  const _Voxel3DPainter({
+    required this.voxels,
+    required this.voxelSize,
+    required this.yaw,
+    required this.pitch,
+    required this.zoom,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    final bg = Paint()
+      ..color = const Color(0xFF05080D)
+      ..style = PaintingStyle.fill;
+
+    canvas.drawRect(
+      Offset.zero & size,
+      bg,
+    );
+
+    final camera = _Camera3D(
+      yaw: yaw,
+      pitch: pitch,
+      zoom: zoom,
+      size: size,
+    );
+
+    final projectedCubes = <_ProjectedCube>[];
+
+    final half = voxelSize / 2.0;
+
+    // Draw only the bounded visualization voxel set received
+    // from native Stage 2.
+    for (final voxel in voxels) {
+      final cx = (voxel.x + 0.5) * voxelSize;
+      final cy = (voxel.y + 0.5) * voxelSize;
+      final cz = (voxel.z + 0.5) * voxelSize;
+
+      final corners = <_ProjectedPoint?>[
+        camera.project(cx - half, cy - half, cz - half),
+        camera.project(cx + half, cy - half, cz - half),
+        camera.project(cx + half, cy + half, cz - half),
+        camera.project(cx - half, cy + half, cz - half),
+        camera.project(cx - half, cy - half, cz + half),
+        camera.project(cx + half, cy - half, cz + half),
+        camera.project(cx + half, cy + half, cz + half),
+        camera.project(cx - half, cy + half, cz + half),
+      ];
+
+      if (corners.any((c) => c == null)) {
+        continue;
+      }
+
+      final validCorners =
+          corners.cast<_ProjectedPoint>();
+
+      final avgDepth = validCorners
+              .map((p) => p.depth)
+              .reduce((a, b) => a + b) /
+          validCorners.length;
+
+      projectedCubes.add(
+        _ProjectedCube(
+          corners: validCorners,
+          depth: avgDepth,
+        ),
+      );
+    }
+
+    // Farther cubes first.
+    projectedCubes.sort(
+      (a, b) => a.depth.compareTo(b.depth),
+    );
+
+    for (final cube in projectedCubes) {
+      _drawCube(
+        canvas,
+        cube,
+      );
+    }
+
+    _drawAxes(canvas, camera);
+  }
+
+  void _drawCube(
+    Canvas canvas,
+    _ProjectedCube cube,
+  ) {
+    final p = cube.corners;
+
+    final topPaint = Paint()
+      ..color = const Color(0xFFFFC15A).withOpacity(0.82)
+      ..style = PaintingStyle.fill;
+
+    final sidePaint = Paint()
+      ..color = const Color(0xFFFFA83D).withOpacity(0.78)
+      ..style = PaintingStyle.fill;
+
+    final frontPaint = Paint()
+      ..color = const Color(0xFFFF8F24).withOpacity(0.72)
+      ..style = PaintingStyle.fill;
+
+    final edgePaint = Paint()
+      ..color = const Color(0xFFFFC15A).withOpacity(0.42)
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = 0.55;
+
+    final front = Path()
+      ..moveTo(p[0].offset.dx, p[0].offset.dy)
+      ..lineTo(p[1].offset.dx, p[1].offset.dy)
+      ..lineTo(p[2].offset.dx, p[2].offset.dy)
+      ..lineTo(p[3].offset.dx, p[3].offset.dy)
+      ..close();
+
+    final back = Path()
+      ..moveTo(p[4].offset.dx, p[4].offset.dy)
+      ..lineTo(p[5].offset.dx, p[5].offset.dy)
+      ..lineTo(p[6].offset.dx, p[6].offset.dy)
+      ..lineTo(p[7].offset.dx, p[7].offset.dy)
+      ..close();
+
+    canvas.drawPath(
+      front,
+      frontPaint,
+    );
+
+    canvas.drawPath(
+      back,
+      topPaint,
+    );
+
+    final side1 = Path()
+      ..moveTo(p[1].offset.dx, p[1].offset.dy)
+      ..lineTo(p[5].offset.dx, p[5].offset.dy)
+      ..lineTo(p[6].offset.dx, p[6].offset.dy)
+      ..lineTo(p[2].offset.dx, p[2].offset.dy)
+      ..close();
+
+    final side2 = Path()
+      ..moveTo(p[3].offset.dx, p[3].offset.dy)
+      ..lineTo(p[7].offset.dx, p[7].offset.dy)
+      ..lineTo(p[6].offset.dx, p[6].offset.dy)
+      ..lineTo(p[2].offset.dx, p[2].offset.dy)
+      ..close();
+
+    canvas.drawPath(
+      side1,
+      sidePaint,
+    );
+
+    canvas.drawPath(
+      side2,
+      Paint()..color = topPaint.color.withOpacity(0.55),
+    );
+
+    final edges = <List<int>>[
+      [0, 1],
+      [1, 2],
+      [2, 3],
+      [3, 0],
+      [4, 5],
+      [5, 6],
+      [6, 7],
+      [7, 4],
+      [0, 4],
+      [1, 5],
+      [2, 6],
+      [3, 7],
+    ];
+
+    for (final edge in edges) {
+      canvas.drawLine(
+        p[edge[0]].offset,
+        p[edge[1]].offset,
+        edgePaint,
+      );
+    }
+  }
+
+  void _drawAxes(Canvas canvas, _Camera3D camera) {
+    final axisPaintX = Paint()
+      ..color = Colors.redAccent
+      ..strokeWidth = 1.5;
+
+    final axisPaintY = Paint()
+      ..color = Colors.greenAccent
+      ..strokeWidth = 1.5;
+
+    final axisPaintZ = Paint()
+      ..color = Colors.blueAccent
+      ..strokeWidth = 1.5;
+
+    _axis(
+      canvas,
+      camera,
+      1,
+      0,
+      0,
+      axisPaintX,
+      'X',
+    );
+
+    _axis(
+      canvas,
+      camera,
+      0,
+      1,
+      0,
+      axisPaintY,
+      'Y',
+    );
+
+    _axis(
+      canvas,
+      camera,
+      0,
+      0,
+      1,
+      axisPaintZ,
+      'Z',
+    );
+  }
+
+  void _axis(
+    Canvas canvas,
+    _Camera3D camera,
+    double x,
+    double y,
+    double z,
+    Paint paint,
+    String label,
+  ) {
+    final p1 = camera.project(0, 0, 0);
+    final p2 = camera.project(x, y, z);
+
+    if (p1 == null || p2 == null) {
+      return;
+    }
+
+    canvas.drawLine(
+      p1.offset,
+      p2.offset,
+      paint,
+    );
+
+    final textPainter = TextPainter(
+      text: TextSpan(
+        text: label,
+        style: TextStyle(
+          color: paint.color,
+          fontSize: 11,
+          fontWeight: FontWeight.bold,
+        ),
+      ),
+      textDirection: TextDirection.ltr,
+    )..layout();
+
+    textPainter.paint(
+      canvas,
+      p2.offset + const Offset(4, -4),
+    );
+  }
+
+  @override
+  bool shouldRepaint(covariant _Voxel3DPainter oldDelegate) {
+    return oldDelegate.voxels != voxels ||
+        oldDelegate.yaw != yaw ||
+        oldDelegate.pitch != pitch ||
+        oldDelegate.zoom != zoom;
+  }
+}
+
+class _ProjectedCube {
+  final List<_ProjectedPoint> corners;
+  final double depth;
+
+  const _ProjectedCube({
+    required this.corners,
+    required this.depth,
+  });
+}

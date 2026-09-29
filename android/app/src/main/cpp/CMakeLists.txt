@@ -20,13 +20,38 @@ set(BUILD_WITH_TM2 OFF CACHE BOOL "" FORCE)
 
 add_subdirectory(librealsense)
 
+# OpenCV Android SDK for dynamic Stage 4 CV workload
+set(OpenCV_DIR
+    "/home/naveen/android_libs/OpenCV-android-sdk/sdk/native/jni"
+    CACHE PATH "OpenCV Android SDK CMake directory")
+
+find_package(OpenCV REQUIRED COMPONENTS
+        core
+        imgproc
+        features2d
+        video
+        calib3d)
+
+message(STATUS "HSV2 OpenCV version: ${OpenCV_VERSION}")
+message(STATUS "HSV2 OpenCV include dirs: ${OpenCV_INCLUDE_DIRS}")
+
+
 set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fexceptions")
-include_directories(librealsense/include)
+include_directories(
+        librealsense/include
+        librealsense/src
+        librealsense/src/backend
+        librealsense/src/ds5
+        librealsense/src/types
+        librealsense/src/core
+)
 
 add_library(
         hsv2_lite
         SHARED
-        native-lib.cpp)
+        native-lib.cpp
+        vio/imu_buffer.cpp
+        vio/vio_engine.cpp)
 
 find_library(
         log-lib
@@ -41,5 +66,6 @@ target_compile_options(hsv2_lite PRIVATE -fexceptions -frtti)
 target_link_libraries(
         hsv2_lite
         realsense2
+        ${OpenCV_LIBS}
         ${log-lib}
         ${android-lib})

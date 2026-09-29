@@ -1,0 +1,5493 @@
+#include <iomanip>
+#include <sstream>
+#include <jni.h>
+#include <string>
+#include <android/log.h>
+#include "vio/vio_engine.h"
+#include "librealsense/src/ds5/ds5-motion.h"
+#include "librealsense/src/ds5/ds5-color.h"
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <thread>
+#include <atomic>
+#include <mutex>
+#include <array>
+#include <vector>
+#include <deque>
+#include <cstring>
+#include <chrono>
+#include <random>
+#include <algorithm>
+#include <cmath>
+#include <fstream>
+#include <iomanip>
+#include <sys/stat.h>
+
+#include <librealsense2/rs.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/video/tracking.hpp>
+#include <opencv2/calib3d.hpp>
+
+#include <librealsense2/rsutil.h>
+#include <android/asset_manager.h>
+#include <android/asset_manager_jni.h>
+
+#define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "HSV2Native", __VA_ARGS__)
+#define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "HSV2Native", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "HSV2Native", __VA_ARGS__)
+
+int currentStage = 1;
+
+// Stage 2 runtime decimation.
+// 2x is the default baseline; 4x is selectable for Stage 2.7 comparison.
+std::atomic<int> stage2_decimation(2);
+
+// Actual VIO integration engine.
+hsv2::VioEngine g_vio_engine;
+
+// Persist the selected D455 IMU stream profiles so camera<->IMU
+// calibration/extrinsics can be queried after sensor startup.
+rs2::stream_profile g_d455_gyro_profile;
+rs2::stream_profile g_d455_accel_profile;
+bool g_d455_imu_profiles_valid = false;
+
+bool isCameraInitialized = false;
+
+// ============================================================================
+// RealSense Global State
+// ============================================================================
+
+std::unique_ptr<rs2::context> rs_ctx;
+std::unique_ptr<rs2::pipeline> rs_pipe;
+
+// ============================================================================
+// D455 IMU synchronization state
+// ============================================================================
+
+std::mutex imu_mutex;
+
+double latest_gyro_timestamp_ms = 0.0;
+double latest_accel_timestamp_ms = 0.0;
+
+rs2_vector latest_gyro_data{};
+rs2_vector latest_accel_data{};
+
+bool imu_streaming = false;
+
+ANativeWindow* nativeWindow = nullptr;
+ANativeWindow* depthNativeWindow = nullptr;
+
+std::atomic<bool> isStreaming(false);
+std::thread streamThread;
+std::atomic<double> current_fps(0.0);
+
+std::atomic<unsigned long long> imu_gyro_count(0);
+std::atomic<unsigned long long> imu_accel_count(0);
+
+// Keep the D455 motion sensor handle alive for the lifetime of IMU streaming.
+rs2::sensor g_d455_motion_sensor;
+bool g_d455_motion_sensor_valid = false;
+
+// ============================================================================
+// Fixed Test Sequence Recorder
+// ============================================================================
+//
+// Records synchronized RGB + Depth frames and RealSense hardware timestamps.
+// Used for deterministic live-vs-replay comparison.
+//
+
+std::mutex recorder_mutex;
+
+bool fixed_recording = false;
+
+std::string fixed_recording_dir;
+
+std::ofstream fixed_rgb_file;
+std::ofstream fixed_depth_file;
+std::ofstream fixed_metadata_file;
+
+unsigned long long fixed_recording_frame_count = 0;
+
+std::chrono::steady_clock::time_point fixed_recording_start_time;
+
+constexpr int FIXED_RECORDING_DURATION_SEC = 60;
+
+// ============================================================================
+// D455 RGB <-> Depth calibration
+// ============================================================================
+
+rs2_intrinsics color_intrinsics{};
+rs2_intrinsics depth_intrinsics{};
+
+rs2_extrinsics color_to_depth_extrinsics{};
+rs2_extrinsics depth_to_color_extrinsics{};
+
+float depth_scale = 0.001f;
+bool calibration_ready = false;
+
+// ============================================================================
+// STAGE 2.1 - DEPTH ALIGNMENT
+// Align D455 depth into the RGB/color coordinate system.
+// This is isolated to Stage 2 and does not modify P3.2.
+// ============================================================================
+static rs2::align stage2_align_to_color(RS2_STREAM_COLOR);
+
+
+// ============================================================================
+// Telemetry state
+// ============================================================================
+
+std::mutex telemetry_mutex;
+char telemetry_json[4096] = "{}";
+
+// ============================================================
+// LIVE LATENCY HISTORY
+// Maintains recent latency samples and calculates p50/p95/p99.
+// ============================================================
+static std::mutex latency_history_mutex;
+static std::vector<double> latency_history_ms;
+
+static void add_latency_sample(double latency_ms) {
+    std::lock_guard<std::mutex> lock(latency_history_mutex);
+
+    latency_history_ms.push_back(latency_ms);
+
+    // Keep the latest 1000 samples.
+    if (latency_history_ms.size() > 1000) {
+        latency_history_ms.erase(
+                latency_history_ms.begin(),
+                latency_history_ms.begin() +
+                (latency_history_ms.size() - 1000));
+    }
+}
+
+static double calculate_percentile(double percentile) {
+    std::lock_guard<std::mutex> lock(latency_history_mutex);
+
+    if (latency_history_ms.empty()) {
+        return 0.0;
+    }
+
+    std::vector<double> samples = latency_history_ms;
+    std::sort(samples.begin(), samples.end());
+
+    double position =
+            (percentile / 100.0) *
+            static_cast<double>(samples.size() - 1);
+
+    size_t lower = static_cast<size_t>(position);
+    size_t upper = lower + 1;
+
+    if (upper >= samples.size()) {
+        return samples[lower];
+    }
+
+    double fraction =
+            position - static_cast<double>(lower);
+
+    return samples[lower] +
+           fraction * (samples[upper] - samples[lower]);
+}
+
+static double read_latency_p50() {
+    return calculate_percentile(50.0);
+}
+
+static double read_latency_p95() {
+    return calculate_percentile(95.0);
+}
+
+static double read_latency_p99() {
+    return calculate_percentile(99.0);
+}
+
+
+
+// ============================================================
+// LIVE CPU CLOCK TELEMETRY
+// Reads CPU0..CPU7 current frequency.
+// scaling_cur_freq is reported in kHz.
+// Returns highest current CPU frequency in MHz.
+// ============================================================
+
+// ============================================================
+// LIVE THERMAL TELEMETRY
+// Reads thermal_zone0..thermal_zone63.
+// Returns the hottest valid temperature in Celsius.
+// ============================================================
+
+// ============================================================
+// LIVE BATTERY TELEMETRY
+// Reads Android battery capacity from sysfs.
+// Returns percentage [0..100], or -1 if unavailable.
+// ============================================================
+static float read_battery_percent() {
+    const char* paths[] = {
+            "/sys/class/power_supply/battery/capacity",
+            "/sys/class/power_supply/BAT0/capacity"
+    };
+
+    for (const char* path : paths) {
+        std::ifstream battery_file(path);
+
+        if (!battery_file.is_open()) {
+            continue;
+        }
+
+        int capacity = -1;
+        battery_file >> capacity;
+
+        if (!battery_file.fail() &&
+            capacity >= 0 &&
+            capacity <= 100) {
+            return static_cast<float>(capacity);
+        }
+    }
+
+    return -1.0f;
+}
+
+static float read_max_thermal_celsius() {
+    float max_cpu_temp_c = -1.0f;
+
+    // Read actual CPU thermal zones only.
+    // Exclude cpu-hw-trip-* because those are hardware
+    // trip thresholds rather than current CPU temperatures.
+    for (int zone = 0; zone < 128; ++zone) {
+        const std::string base_path =
+                "/sys/class/thermal/thermal_zone" +
+                std::to_string(zone);
+
+        const std::string type_path = base_path + "/type";
+        const std::string temp_path = base_path + "/temp";
+
+        std::ifstream type_file(type_path);
+        std::ifstream temp_file(temp_path);
+
+        if (!type_file.is_open() || !temp_file.is_open()) {
+            continue;
+        }
+
+        std::string zone_type;
+        std::getline(type_file, zone_type);
+
+        // Keep only real CPU thermal zones.
+        if (zone_type.rfind("cpu-", 0) != 0) {
+            continue;
+        }
+
+        // Ignore hardware thermal trip threshold zones.
+        if (zone_type.rfind("cpu-hw-trip-", 0) == 0) {
+            continue;
+        }
+
+        long temp_raw = 0;
+        temp_file >> temp_raw;
+
+        if (temp_file.fail()) {
+            continue;
+        }
+
+        const float temp_c =
+                static_cast<float>(temp_raw) / 1000.0f;
+
+        if (temp_c >= 0.0f && temp_c <= 120.0f) {
+            if (temp_c > max_cpu_temp_c) {
+                max_cpu_temp_c = temp_c;
+            }
+        }
+    }
+
+    return max_cpu_temp_c;
+}
+
+static std::string read_cpu_thermal_zones_json() {
+    std::string json = "{";
+    bool first = true;
+
+    // Record every actual CPU thermal zone individually.
+    // Exclude cpu-hw-trip-* because those are trip thresholds,
+    // not current CPU temperatures.
+    for (int zone = 0; zone < 128; ++zone) {
+        const std::string base_path =
+                "/sys/class/thermal/thermal_zone" +
+                std::to_string(zone);
+
+        const std::string type_path = base_path + "/type";
+        const std::string temp_path = base_path + "/temp";
+
+        std::ifstream type_file(type_path);
+        std::ifstream temp_file(temp_path);
+
+        if (!type_file.is_open() || !temp_file.is_open()) {
+            continue;
+        }
+
+        std::string zone_type;
+        std::getline(type_file, zone_type);
+
+        if (zone_type.rfind("cpu-", 0) != 0) {
+            continue;
+        }
+
+        if (zone_type.rfind("cpu-hw-trip-", 0) == 0) {
+            continue;
+        }
+
+        long temp_raw = 0;
+        temp_file >> temp_raw;
+
+        if (temp_file.fail()) {
+            continue;
+        }
+
+        const float temp_c =
+                static_cast<float>(temp_raw) / 1000.0f;
+
+        if (temp_c < 0.0f || temp_c > 120.0f) {
+            continue;
+        }
+
+        if (!first) {
+            json += ",";
+        }
+
+        json += "\"";
+        json += zone_type;
+        json += "\":";
+        json += std::to_string(temp_c);
+
+        first = false;
+    }
+
+    json += "}";
+    return json;
+}
+
+static float read_cpu_clock_max_mhz() {
+    float max_freq_mhz = -1.0f;
+
+    for (int cpu = 0; cpu < 8; ++cpu) {
+        std::string path =
+                "/sys/devices/system/cpu/cpu" +
+                std::to_string(cpu) +
+                "/cpufreq/scaling_cur_freq";
+
+        std::ifstream freq_file(path);
+
+        if (!freq_file.is_open()) {
+            continue;
+        }
+
+        long freq_khz = 0;
+        freq_file >> freq_khz;
+
+        if (freq_file.fail() || freq_khz <= 0) {
+            continue;
+        }
+
+        float freq_mhz =
+                static_cast<float>(freq_khz) / 1000.0f;
+
+        if (freq_mhz > max_freq_mhz) {
+            max_freq_mhz = freq_mhz;
+        }
+    }
+
+    return max_freq_mhz;
+}
+
+
+
+// ============================================================================
+// Latest RGB frame
+// ============================================================================
+
+std::mutex latest_rgb_mutex;
+
+std::vector<uint8_t> latest_rgb_frame;
+
+int latest_rgb_width = 0;
+int latest_rgb_height = 0;
+
+double latest_rgb_timestamp_ms = 0.0;
+
+unsigned long long latest_rgb_frame_num = 0;
+
+// ============================================================================
+// Latest Depth frame
+// ============================================================================
+
+std::mutex latest_depth_mutex;
+
+std::vector<uint16_t> latest_depth_frame;
+
+int latest_depth_width = 0;
+int latest_depth_height = 0;
+
+double latest_depth_timestamp_ms = 0.0;
+
+unsigned long long latest_depth_frame_num = 0;
+
+// ============================================================================
+// P3.1 Ground Plane State
+// ============================================================================
+
+struct P31GroundPlane {
+    float nx = 0.0f;
+    float ny = 0.0f;
+    float nz = 0.0f;
+    float d = 0.0f;
+
+    int inliers = 0;
+    int sampled_points = 0;
+
+    float mean_error_m = 0.0f;
+
+    bool valid = false;
+    bool using_fallback = false;
+};
+
+std::mutex ground_plane_mutex;
+P31GroundPlane latest_ground_plane;
+
+constexpr int P31_RANSAC_ITERATIONS = 80;
+constexpr int P31_MAX_RANSAC_POINTS = 6000;
+
+constexpr float P31_PLANE_DISTANCE_THRESHOLD_M = 0.020f;
+
+constexpr float P31_MIN_DEPTH_M = 0.30f;
+constexpr float P31_MAX_DEPTH_M = 5.00f;
+
+constexpr int P31_MIN_GROUND_INLIERS = 1200;
+
+constexpr int P31_MAX_CONSECUTIVE_FALLBACKS = 15;
+constexpr float P31_MAX_PLANE_D_DELTA_M = 0.40f;
+
+int p31_consecutive_fallbacks = 0;
+
+// P3.1 performance: run the expensive RANSAC estimation
+// every 3rd depth frame (~5 Hz at a 15 FPS camera rate).
+// The latest valid plane is reused between RANSAC updates.
+int p31_frame_counter = 0;
+constexpr int P31_UPDATE_EVERY_N_FRAMES = 3;
+
+
+// ============================================================================
+// P3.1 Ground Plane RANSAC
+// ============================================================================
+
+static bool fitP31PlaneFromPoints(
+        const rs2::depth_frame& depth_frame,
+        P31GroundPlane& output) {
+
+    if (!depth_frame || !calibration_ready) {
+        return false;
+    }
+
+    const int width = depth_frame.get_width();
+    const int height = depth_frame.get_height();
+
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    std::vector<std::array<float, 3>> points;
+    points.reserve(P31_MAX_RANSAC_POINTS);
+
+    // Sample the lower/middle image region where the ground plane is
+    // expected to be visible. Decimation keeps the computation bounded.
+    constexpr int STEP = 2;
+
+    for (int y = height / 3; y < height; y += STEP) {
+        for (int x = 0; x < width; x += STEP) {
+
+            const float depth_m =
+                    depth_frame.get_distance(x, y);
+
+            if (depth_m < P31_MIN_DEPTH_M ||
+                depth_m > P31_MAX_DEPTH_M) {
+                continue;
+            }
+
+            float pixel[2] = {
+                    static_cast<float>(x),
+                    static_cast<float>(y)
+            };
+
+            float point[3] = {};
+
+            rs2_deproject_pixel_to_point(
+                    point,
+                    &depth_intrinsics,
+                    pixel,
+                    depth_m);
+
+            if (!std::isfinite(point[0]) ||
+                !std::isfinite(point[1]) ||
+                !std::isfinite(point[2])) {
+                continue;
+            }
+
+            points.push_back({
+                    point[0],
+                    point[1],
+                    point[2]
+            });
+
+            if (static_cast<int>(points.size()) >=
+                P31_MAX_RANSAC_POINTS) {
+                break;
+            }
+        }
+
+        if (static_cast<int>(points.size()) >=
+            P31_MAX_RANSAC_POINTS) {
+            break;
+        }
+    }
+
+    if (points.size() < 3) {
+        return false;
+    }
+
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<size_t> distribution(
+            0,
+            points.size() - 1);
+
+    int best_inliers = 0;
+    float best_error = std::numeric_limits<float>::max();
+
+    float best_nx = 0.0f;
+    float best_ny = 0.0f;
+    float best_nz = 0.0f;
+    float best_d = 0.0f;
+
+    for (int iteration = 0;
+         iteration < P31_RANSAC_ITERATIONS;
+         ++iteration) {
+
+        const auto& p1 = points[distribution(rng)];
+        const auto& p2 = points[distribution(rng)];
+        const auto& p3 = points[distribution(rng)];
+
+        const float ax = p2[0] - p1[0];
+        const float ay = p2[1] - p1[1];
+        const float az = p2[2] - p1[2];
+
+        const float bx = p3[0] - p1[0];
+        const float by = p3[1] - p1[1];
+        const float bz = p3[2] - p1[2];
+
+        float nx = ay * bz - az * by;
+        float ny = az * bx - ax * bz;
+        float nz = ax * by - ay * bx;
+
+        const float norm =
+                std::sqrt(nx * nx + ny * ny + nz * nz);
+
+        if (norm < 1e-6f) {
+            continue;
+        }
+
+        nx /= norm;
+        ny /= norm;
+        nz /= norm;
+
+        float d =
+                -(nx * p1[0] +
+                  ny * p1[1] +
+                  nz * p1[2]);
+
+        // Keep the normal orientation consistent with the camera frame.
+        if (ny > 0.0f) {
+            nx = -nx;
+            ny = -ny;
+            nz = -nz;
+            d = -d;
+        }
+
+        int inliers = 0;
+        double error_sum = 0.0;
+
+        for (const auto& point : points) {
+
+            const float distance =
+                    std::fabs(
+                            nx * point[0] +
+                            ny * point[1] +
+                            nz * point[2] +
+                            d);
+
+            if (distance <=
+                P31_PLANE_DISTANCE_THRESHOLD_M) {
+
+                ++inliers;
+                error_sum += distance;
+            }
+        }
+
+        const float mean_error =
+                inliers > 0
+                        ? static_cast<float>(
+                                error_sum /
+                                static_cast<double>(inliers))
+                        : std::numeric_limits<float>::max();
+
+        if (inliers > best_inliers ||
+            (inliers == best_inliers &&
+             mean_error < best_error)) {
+
+            best_inliers = inliers;
+            best_error = mean_error;
+
+            best_nx = nx;
+            best_ny = ny;
+            best_nz = nz;
+            best_d = d;
+        }
+    }
+
+    output.nx = best_nx;
+    output.ny = best_ny;
+    output.nz = best_nz;
+    output.d = best_d;
+    output.inliers = best_inliers;
+    output.sampled_points =
+            static_cast<int>(points.size());
+    output.mean_error_m =
+            best_error;
+
+    return best_inliers >= P31_MIN_GROUND_INLIERS;
+}
+
+static bool runP31GroundPlane(
+        const rs2::depth_frame& depth_frame,
+        P31GroundPlane& output) {
+
+    // Reuse the latest valid plane between RANSAC updates.
+    ++p31_frame_counter;
+    if ((p31_frame_counter % P31_UPDATE_EVERY_N_FRAMES) != 0) {
+        std::lock_guard<std::mutex> lock(ground_plane_mutex);
+        output = latest_ground_plane;
+        return output.valid;
+    }
+
+    P31GroundPlane candidate;
+
+    if (!fitP31PlaneFromPoints(
+                depth_frame,
+                candidate)) {
+
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        ++p31_consecutive_fallbacks;
+
+        if (p31_consecutive_fallbacks <=
+            P31_MAX_CONSECUTIVE_FALLBACKS &&
+            latest_ground_plane.valid) {
+
+            latest_ground_plane.using_fallback = true;
+        } else {
+            latest_ground_plane.valid = false;
+            latest_ground_plane.using_fallback = false;
+        }
+
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        // Reject an implausibly large sudden plane-distance change.
+        if (latest_ground_plane.valid) {
+
+            const float previous_d =
+                    latest_ground_plane.d;
+
+            if (std::fabs(candidate.d - previous_d) >
+                P31_MAX_PLANE_D_DELTA_M) {
+
+                ++p31_consecutive_fallbacks;
+
+                if (p31_consecutive_fallbacks <=
+                    P31_MAX_CONSECUTIVE_FALLBACKS) {
+
+                    latest_ground_plane.using_fallback = true;
+                } else {
+                    latest_ground_plane.valid = false;
+                    latest_ground_plane.using_fallback = false;
+                }
+
+                return false;
+            }
+        }
+
+        candidate.valid = true;
+        candidate.using_fallback = false;
+
+        latest_ground_plane = candidate;
+
+        p31_consecutive_fallbacks = 0;
+    }
+
+    return true;
+}
+
+
+// ============================================================================
+// IMU sync logger state
+std::mutex imu_sync_log_mutex;
+std::ofstream imu_sync_log_file;
+bool imu_sync_logging = false;
+std::chrono::steady_clock::time_point imu_sync_start_time;
+
+// IMU -> FRAME SYNC LOGGER
+// ============================================================================
+//
+// Records nearest hardware-timestamped IMU samples for BOTH RGB and depth.
+// This avoids the old "latest IMU sample" association, which can introduce
+// an artificial ~70 ms offset when the IMU callback runs ahead of the frame
+// processing thread.
+//
+// CSV columns:
+// elapsed_ms
+// rgb_frame_number
+// rgb_timestamp_ms
+// depth_frame_number
+// depth_timestamp_ms
+// rgb_gyro_timestamp_ms
+// rgb_accel_timestamp_ms
+// depth_gyro_timestamp_ms
+// depth_accel_timestamp_ms
+// rgb_gyro_delta_ms
+// rgb_accel_delta_ms
+// depth_gyro_delta_ms
+// depth_accel_delta_ms
+// gyro_count
+// accel_count
+// ============================================================================
+
+struct ImuTimestampSample {
+    double timestamp_ms;
+    uint64_t count;
+};
+
+std::deque<ImuTimestampSample> gyro_timestamp_buffer;
+std::deque<ImuTimestampSample> accel_timestamp_buffer;
+
+constexpr size_t IMU_SYNC_BUFFER_SIZE = 1000;
+
+static bool findNearestImuTimestamp(
+        const std::deque<ImuTimestampSample>& buffer,
+        double frame_timestamp_ms,
+        double& nearest_timestamp_ms) {
+
+    if (buffer.empty()) {
+        return false;
+    }
+
+    double best_diff = std::numeric_limits<double>::max();
+    double best_timestamp = 0.0;
+
+    for (const auto& sample : buffer) {
+
+        const double diff =
+                std::abs(sample.timestamp_ms - frame_timestamp_ms);
+
+        if (diff < best_diff) {
+            best_diff = diff;
+            best_timestamp = sample.timestamp_ms;
+        }
+    }
+
+    nearest_timestamp_ms = best_timestamp;
+    return true;
+}
+
+void startImuSyncLogger(const std::string& dir) {
+
+    std::lock_guard<std::mutex> lock(
+            imu_sync_log_mutex);
+
+    if (imu_sync_logging) {
+        return;
+    }
+
+    const std::string path =
+            dir + "/imu_frame_sync.csv";
+
+    imu_sync_log_file.open(
+            path,
+            std::ios::out |
+            std::ios::trunc);
+
+    if (!imu_sync_log_file.is_open()) {
+
+        LOGE(
+                "IMU_SYNC: failed to open log file: %s",
+                path.c_str());
+
+        return;
+    }
+
+    imu_sync_log_file
+            << "elapsed_ms,"
+            << "rgb_frame_number,"
+            << "rgb_timestamp_ms,"
+            << "depth_frame_number,"
+            << "depth_timestamp_ms,"
+            << "rgb_gyro_timestamp_ms,"
+            << "rgb_accel_timestamp_ms,"
+            << "depth_gyro_timestamp_ms,"
+            << "depth_accel_timestamp_ms,"
+            << "rgb_gyro_delta_ms,"
+            << "rgb_accel_delta_ms,"
+            << "depth_gyro_delta_ms,"
+            << "depth_accel_delta_ms,"
+            << "gyro_count,"
+            << "accel_count\n";
+
+    // Start this validation log with fresh IMU history.
+    {
+        std::lock_guard<std::mutex> imu_lock(
+                imu_mutex);
+
+        gyro_timestamp_buffer.clear();
+        accel_timestamp_buffer.clear();
+    }
+
+    imu_sync_start_time =
+            std::chrono::steady_clock::now();
+
+    imu_sync_logging = true;
+
+    LOGI(
+            "IMU_SYNC: logging started: %s",
+            path.c_str());
+}
+
+void recordImuFrameSync(
+        const rs2::video_frame& color_frame,
+        const rs2::depth_frame& depth_frame) {
+
+    std::lock_guard<std::mutex> log_lock(
+            imu_sync_log_mutex);
+
+    if (!imu_sync_logging ||
+        !imu_sync_log_file.is_open()) {
+        return;
+    }
+
+    const double rgb_ts =
+            color_frame.get_timestamp();
+
+    const double depth_ts =
+            depth_frame.get_timestamp();
+
+    double rgb_gyro_ts = 0.0;
+    double rgb_accel_ts = 0.0;
+    double depth_gyro_ts = 0.0;
+    double depth_accel_ts = 0.0;
+
+    uint64_t gyro_count = 0;
+    uint64_t accel_count = 0;
+
+    {
+        std::lock_guard<std::mutex> imu_lock(
+                imu_mutex);
+
+        findNearestImuTimestamp(
+                gyro_timestamp_buffer,
+                rgb_ts,
+                rgb_gyro_ts);
+
+        findNearestImuTimestamp(
+                accel_timestamp_buffer,
+                rgb_ts,
+                rgb_accel_ts);
+
+        findNearestImuTimestamp(
+                gyro_timestamp_buffer,
+                depth_ts,
+                depth_gyro_ts);
+
+        findNearestImuTimestamp(
+                accel_timestamp_buffer,
+                depth_ts,
+                depth_accel_ts);
+
+        gyro_count =
+                imu_gyro_count.load();
+
+        accel_count =
+                imu_accel_count.load();
+    }
+
+    const double elapsed_ms =
+            std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() -
+                    imu_sync_start_time)
+                    .count();
+
+    const double rgb_gyro_delta =
+            rgb_gyro_ts != 0.0
+                    ? rgb_ts - rgb_gyro_ts
+                    : 0.0;
+
+    const double rgb_accel_delta =
+            rgb_accel_ts != 0.0
+                    ? rgb_ts - rgb_accel_ts
+                    : 0.0;
+
+    const double depth_gyro_delta =
+            depth_gyro_ts != 0.0
+                    ? depth_ts - depth_gyro_ts
+                    : 0.0;
+
+    const double depth_accel_delta =
+            depth_accel_ts != 0.0
+                    ? depth_ts - depth_accel_ts
+                    : 0.0;
+
+    imu_sync_log_file
+            << std::fixed
+            << std::setprecision(3)
+            << elapsed_ms << ","
+            << color_frame.get_frame_number() << ","
+            << rgb_ts << ","
+            << depth_frame.get_frame_number() << ","
+            << depth_ts << ","
+            << rgb_gyro_ts << ","
+            << rgb_accel_ts << ","
+            << depth_gyro_ts << ","
+            << depth_accel_ts << ","
+            << rgb_gyro_delta << ","
+            << rgb_accel_delta << ","
+            << depth_gyro_delta << ","
+            << depth_accel_delta << ","
+            << gyro_count << ","
+            << accel_count
+            << "\n";
+
+    imu_sync_log_file.flush();
+}
+
+void stopImuSyncLogger() {
+
+    std::lock_guard<std::mutex> lock(
+            imu_sync_log_mutex);
+
+    if (!imu_sync_logging) {
+        return;
+    }
+
+    imu_sync_log_file.flush();
+    imu_sync_log_file.close();
+
+    imu_sync_logging = false;
+
+    LOGI("IMU_SYNC: logging stopped");
+}
+
+
+// ============================================================================
+
+// RGB BOX -> DEPTH BOX MAPPING
+// ============================================================================
+//
+// MediaPipe detection box:
+//
+//     RGB image
+//        |
+//        v
+//     RGB bounding box
+//        |
+//        v
+//     RealSense RGB -> Depth projection
+//        |
+//        v
+//     Depth bounding box
+//
+// The resulting depth box will later be passed to DepthProcessor for
+// central ROI median depth calculation.
+// ============================================================================
+
+
+// ============================================================================
+// LADDER STAGE 2
+// Decimated depth -> 3D deprojection -> single-frame voxel grid
+// ============================================================================
+//
+// This is an additional workload. It does not replace the MediaPipe pipeline.
+// One depth frame is decimated by 2x, deprojected using the runtime D455
+// depth intrinsics, and inserted into a single-frame voxel grid.
+//
+
+
+// ============================================================================
+// ============================================================================
+// Stage 4: Dynamic VIO-shaped visual compute
+// ============================================================================
+//
+// This is a dynamic visual-tracking workload driven by REAL D455 RGB frames.
+//
+// Pipeline:
+//   RGBA frame
+//      -> grayscale
+//      -> FAST feature detection
+//      -> LK optical-flow tracking
+//      -> essential matrix
+//      -> recoverPose
+//      -> depth-backed local 3D point processing
+//      -> keyframe/local-point maintenance
+//
+// IMPORTANT:
+// This is NOT a production VIO / SLAM implementation.
+// It is a dynamic VIO-shaped concurrent compute stage.
+// The existing VioEngine remains separate.
+// ============================================================================
+
+struct Stage4DynamicResult {
+    bool processed = false;
+    bool pose_valid = false;
+
+    // 0 = no pose, 1 = essential/recoverPose,
+    // 2 = homography fallback.
+    int pose_mode = 0;
+
+    int features = 0;
+    int tracked = 0;
+    int inliers = 0;
+    int local_points = 0;
+
+    double tx = 0.0;
+    double ty = 0.0;
+    double tz = 0.0;
+
+    double processing_ms = 0.0;
+};
+
+
+static void detectStage4FastFeatures(
+        const cv::Mat& gray,
+        std::vector<cv::Point2f>& points,
+        int threshold = 20,
+        size_t maximum = 300) {
+
+    std::vector<cv::KeyPoint> keypoints;
+
+    cv::FAST(
+            gray,
+            keypoints,
+            threshold,
+            true);
+
+    points.clear();
+
+    if (keypoints.empty() || maximum == 0) {
+        return;
+    }
+
+    // ------------------------------------------------------------------------
+    // Spatially balanced FAST feature selection.
+    //
+    // FAST itself remains unchanged. Instead of taking the first N keypoints
+    // globally, divide the image into cells and retain the strongest
+    // response points from each cell. This prevents highly textured regions
+    // (for example a ceiling) from consuming the entire feature budget.
+    // ------------------------------------------------------------------------
+
+    constexpr int GRID_COLS = 10;
+    constexpr int GRID_ROWS = 6;
+
+    const int width = gray.cols;
+    const int height = gray.rows;
+
+    if (width <= 0 || height <= 0) {
+        return;
+    }
+
+    std::vector<std::vector<cv::KeyPoint>> cells(
+            GRID_COLS * GRID_ROWS);
+
+    for (const auto& kp : keypoints) {
+
+        const int col = std::clamp(
+                static_cast<int>(
+                        kp.pt.x * GRID_COLS / width),
+                0,
+                GRID_COLS - 1);
+
+        const int row = std::clamp(
+                static_cast<int>(
+                        kp.pt.y * GRID_ROWS / height),
+                0,
+                GRID_ROWS - 1);
+
+        cells[row * GRID_COLS + col].push_back(kp);
+    }
+
+    // Approximately 5 features per cell gives up to 300 features.
+    const size_t perCell =
+            std::max<size_t>(
+                    1,
+                    maximum /
+                    static_cast<size_t>(
+                            GRID_COLS * GRID_ROWS));
+
+    points.reserve(maximum);
+
+    for (auto& cell : cells) {
+
+        std::sort(
+                cell.begin(),
+                cell.end(),
+                [](const cv::KeyPoint& a,
+                   const cv::KeyPoint& b) {
+                    return a.response > b.response;
+                });
+
+        const size_t count =
+                std::min(
+                        perCell,
+                        cell.size());
+
+        for (size_t i = 0; i < count; ++i) {
+
+            points.push_back(
+                    cell[i].pt);
+
+            if (points.size() >= maximum) {
+                break;
+            }
+        }
+
+        if (points.size() >= maximum) {
+            break;
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Fill remaining slots if some cells did not contain enough FAST points.
+    // Use strongest unused global keypoints while preserving the spatial
+    // selection already made above.
+    // ------------------------------------------------------------------------
+
+    if (points.size() < maximum) {
+
+        std::sort(
+                keypoints.begin(),
+                keypoints.end(),
+                [](const cv::KeyPoint& a,
+                   const cv::KeyPoint& b) {
+                    return a.response > b.response;
+                });
+
+        for (const auto& kp : keypoints) {
+
+            if (points.size() >= maximum) {
+                break;
+            }
+
+            bool duplicate = false;
+
+            for (const auto& existing : points) {
+
+                const float dx =
+                        existing.x - kp.pt.x;
+
+                const float dy =
+                        existing.y - kp.pt.y;
+
+                if ((dx * dx + dy * dy) < 16.0f) {
+                    duplicate = true;
+                    break;
+                }
+            }
+
+            if (!duplicate) {
+                points.push_back(kp.pt);
+            }
+        }
+    }
+}
+
+// ============================================================================
+// STAGE 4 VISUALIZATION SNAPSHOT
+// UI-only diagnostic snapshot.
+// Does NOT replace or modify the Stage 4 benchmark path.
+// ============================================================================
+
+struct Stage4VisualizationSnapshot {
+    bool valid = false;
+
+    double processing_ms = 0.0;
+
+    int features = 0;
+    int tracked = 0;
+    int inliers = 0;
+    int local_points = 0;
+
+    bool pose_valid = false;
+    int pose_mode = 0;
+
+    double tx = 0.0;
+    double ty = 0.0;
+    double tz = 0.0;
+
+    int rgb_width = 0;
+    int rgb_height = 0;
+
+    std::vector<cv::Point2f> feature_points;
+    std::vector<std::array<float, 3>> local_3d;
+};
+
+static std::mutex stage4_visualization_mutex;
+
+static Stage4VisualizationSnapshot
+        latest_stage4_visualization;
+
+class Stage4DynamicTracker {
+public:
+
+    Stage4DynamicTracker() = default;
+
+    Stage4DynamicResult process(
+            const rs2::video_frame& color_frame,
+            const rs2::depth_frame& depth_frame) {
+
+        Stage4DynamicResult result;
+
+        if (!color_frame) {
+            return result;
+        }
+
+        std::unique_lock<std::mutex> lock(
+                m_mutex,
+                std::try_to_lock);
+
+        // Keep the Stage 4 queue bounded.
+        // If the previous frame is still being processed,
+        // drop this frame instead of building an unbounded backlog.
+        if (!lock.owns_lock()) {
+            return result;
+        }
+
+        const auto start =
+                std::chrono::steady_clock::now();
+
+        const int width =
+                color_frame.get_width();
+
+        const int height =
+                color_frame.get_height();
+
+        const auto* rgba =
+                static_cast<const uint8_t*>(
+                        color_frame.get_data());
+
+        if (!rgba ||
+            width < 32 ||
+            height < 32) {
+            return result;
+        }
+
+        // --------------------------------------------------------------------
+        // 1. RGBA -> grayscale
+        // --------------------------------------------------------------------
+
+        cv::Mat rgba_mat(
+                height,
+                width,
+                CV_8UC4,
+                const_cast<uint8_t*>(rgba));
+
+        cv::Mat gray;
+
+        cv::cvtColor(
+                rgba_mat,
+                gray,
+                cv::COLOR_RGBA2GRAY);
+
+        // --------------------------------------------------------------------
+        // 2. Get actual D455 RGB intrinsics
+        // --------------------------------------------------------------------
+
+        try {
+
+            auto color_profile =
+                    color_frame.get_profile()
+                            .as<rs2::video_stream_profile>();
+
+            const rs2_intrinsics intrinsics =
+                    color_profile.get_intrinsics();
+
+            m_fx = intrinsics.fx;
+            m_fy = intrinsics.fy;
+            m_cx = intrinsics.ppx;
+            m_cy = intrinsics.ppy;
+
+        } catch (...) {
+
+            // If calibration is temporarily unavailable,
+            // use image-center fallback.
+            if (m_fx <= 0.0 || m_fy <= 0.0) {
+                m_fx = static_cast<double>(width);
+                m_fy = static_cast<double>(width);
+                m_cx = width * 0.5;
+                m_cy = height * 0.5;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 3. First frame: initialize dynamic feature state
+        // --------------------------------------------------------------------
+
+        if (m_previous_gray.empty()) {
+
+            detectStage4FastFeatures(
+                    gray,
+                    m_previous_points,
+                    20,
+                    300);
+
+            m_previous_gray = gray.clone();
+
+            m_frame_count++;
+
+            result.processed = true;
+            result.features =
+                    static_cast<int>(
+                            m_previous_points.size());
+
+            std::vector<std::array<float, 3>> first_local_3d;
+
+            result.local_points =
+                    buildLocalDepthPoints(
+                            depth_frame,
+                            m_previous_points,
+                            &first_local_3d);
+
+            result.processing_ms =
+                    elapsedMs(start);
+
+            return result;
+        }
+
+        // --------------------------------------------------------------------
+        // 4. LK optical-flow tracking
+        // --------------------------------------------------------------------
+
+        if (m_previous_points.size() < 50) {
+
+            detectStage4FastFeatures(
+                    m_previous_gray,
+                    m_previous_points,
+                    20,
+                    300);
+        }
+
+        std::vector<cv::Point2f> current_points;
+        std::vector<uint8_t> status;
+        std::vector<float> error;
+
+        if (!m_previous_points.empty()) {
+
+            cv::calcOpticalFlowPyrLK(
+                    m_previous_gray,
+                    gray,
+                    m_previous_points,
+                    current_points,
+                    status,
+                    error,
+                    cv::Size(21, 21),
+                    3,
+                    cv::TermCriteria(
+                            cv::TermCriteria::COUNT |
+                            cv::TermCriteria::EPS,
+                            30,
+                            0.01),
+                    0,
+                    0.001);
+        }
+
+        std::vector<cv::Point2f> prev_good;
+        std::vector<cv::Point2f> curr_good;
+
+        const size_t n =
+                std::min(
+                        current_points.size(),
+                        status.size());
+
+        for (size_t i = 0; i < n; ++i) {
+
+            if (!status[i]) {
+                continue;
+            }
+
+            const cv::Point2f& p0 =
+                    m_previous_points[i];
+
+            const cv::Point2f& p1 =
+                    current_points[i];
+
+            if (!insideImage(
+                        p0,
+                        width,
+                        height) ||
+                !insideImage(
+                        p1,
+                        width,
+                        height)) {
+                continue;
+            }
+
+            const float dx =
+                    p1.x - p0.x;
+
+            const float dy =
+                    p1.y - p0.y;
+
+            const float motion =
+                    std::sqrt(
+                            dx * dx +
+                            dy * dy);
+
+            // Reject obvious LK outliers.
+            if (motion > 80.0f) {
+                continue;
+            }
+
+            prev_good.push_back(p0);
+            curr_good.push_back(p1);
+        }
+
+        result.features =
+                static_cast<int>(
+                        m_previous_points.size());
+
+        result.tracked =
+                static_cast<int>(
+                        curr_good.size());
+
+        // --------------------------------------------------------------------
+        // 5. Relative pose estimation
+        //
+        // Primary:
+        //   Essential matrix + recoverPose
+        //
+        // Fallback:
+        //   Homography decomposition for low-parallax / low-motion frames.
+        //
+        // This is a lightweight VIO-shaped pose stage, not production SLAM.
+        // Homography translation is directional/scale-ambiguous.
+        // --------------------------------------------------------------------
+
+        if (curr_good.size() >= 8) {
+
+            cv::Mat camera_matrix =
+                    (cv::Mat_<double>(3, 3)
+                            << m_fx, 0.0, m_cx,
+                               0.0, m_fy, m_cy,
+                               0.0, 0.0, 1.0);
+
+            // ------------------------------------------------------------
+            // 5A. Primary essential-matrix pose
+            // ------------------------------------------------------------
+
+            cv::Mat essential_mask;
+
+            cv::Mat E =
+                    cv::findEssentialMat(
+                            prev_good,
+                            curr_good,
+                            camera_matrix,
+                            cv::RANSAC,
+                            0.999,
+                            1.5,
+                            essential_mask);
+
+            if (!E.empty()) {
+
+                cv::Mat R;
+                cv::Mat t;
+
+                const int essential_inliers =
+                        cv::recoverPose(
+                                E,
+                                prev_good,
+                                curr_good,
+                                camera_matrix,
+                                R,
+                                t,
+                                essential_mask);
+
+                result.inliers =
+                        essential_inliers;
+
+                if (essential_inliers >= 8 &&
+                    !R.empty() &&
+                    !t.empty()) {
+
+                    result.pose_valid = true;
+                    result.pose_mode = 1;
+
+                    result.tx =
+                            t.at<double>(0, 0);
+
+                    result.ty =
+                            t.at<double>(1, 0);
+
+                    result.tz =
+                            t.at<double>(2, 0);
+                }
+            }
+
+            // ------------------------------------------------------------
+            // 5B. Homography fallback
+            //
+            // Useful when consecutive frames have very small motion,
+            // weak parallax, or a mostly planar visual scene.
+            // ------------------------------------------------------------
+
+            if (!result.pose_valid) {
+
+                cv::Mat homography_mask;
+
+                cv::Mat H =
+                        cv::findHomography(
+                                prev_good,
+                                curr_good,
+                                cv::RANSAC,
+                                3.0,
+                                homography_mask,
+                                2000,
+                                0.995);
+
+                if (!H.empty()) {
+
+                    int homography_inliers = 0;
+
+                    if (!homography_mask.empty()) {
+
+                        for (int i = 0;
+                             i < homography_mask.rows;
+                             ++i) {
+
+                            if (homography_mask.at<uchar>(i, 0)) {
+                                homography_inliers++;
+                            }
+                        }
+                    }
+
+                    const int minimum_homography_inliers = 12;
+
+                    if (homography_inliers >=
+                        minimum_homography_inliers) {
+
+                        std::vector<cv::Mat> rotations;
+                        std::vector<cv::Mat> translations;
+                        std::vector<cv::Mat> normals;
+
+                        const int solutions =
+                                cv::decomposeHomographyMat(
+                                        H,
+                                        camera_matrix,
+                                        rotations,
+                                        translations,
+                                        normals);
+
+                        if (solutions > 0) {
+
+                            int best_index = -1;
+                            double best_angle = 1e9;
+
+                            for (int i = 0;
+                                 i < solutions;
+                                 ++i) {
+
+                                if (rotations[i].empty()) {
+                                    continue;
+                                }
+
+                                cv::Mat rvec;
+
+                                cv::Rodrigues(
+                                        rotations[i],
+                                        rvec);
+
+                                const double angle =
+                                        cv::norm(rvec);
+
+                                if (std::isfinite(angle) &&
+                                    angle < best_angle) {
+
+                                    best_angle = angle;
+                                    best_index = i;
+                                }
+                            }
+
+                            if (best_index >= 0) {
+
+                                result.pose_valid = true;
+                                result.pose_mode = 2;
+
+                                result.inliers =
+                                        homography_inliers;
+
+                                // Homography decomposition gives translation
+                                // direction but not metric scale.
+                                if (translations.size() >
+                                    static_cast<size_t>(best_index)) {
+
+                                    const cv::Mat& ht =
+                                            translations[best_index];
+
+                                    if (ht.rows >= 3) {
+
+                                        result.tx =
+                                                ht.at<double>(0, 0);
+
+                                        result.ty =
+                                                ht.at<double>(1, 0);
+
+                                        result.tz =
+                                                ht.at<double>(2, 0);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 6. Depth-backed local 3D processing
+        // --------------------------------------------------------------------
+
+        std::vector<std::array<float, 3>> local_3d_points;
+
+        result.local_points =
+                buildLocalDepthPoints(
+                        depth_frame,
+                        curr_good,
+                        &local_3d_points);
+
+        // --------------------------------------------------------------------
+        // 7. Dynamic keyframe decision
+        // --------------------------------------------------------------------
+
+        bool create_keyframe = false;
+
+        if (m_frame_count % 30 == 0) {
+            create_keyframe = true;
+        }
+
+        if (result.tracked < 80) {
+            create_keyframe = true;
+        }
+
+        if (create_keyframe) {
+
+            detectStage4FastFeatures(
+                    gray,
+                    m_previous_points,
+                    20,
+                    300);
+
+            m_keyframe_count++;
+        } else {
+
+            m_previous_points =
+                    curr_good;
+        }
+
+        // --------------------------------------------------------------------
+        // 8. Update persistent frame state
+        // --------------------------------------------------------------------
+
+        m_previous_gray =
+                gray.clone();
+
+        m_frame_count++;
+
+        result.processed = true;
+
+        result.processing_ms =
+                elapsedMs(start);
+
+        // --------------------------------------------------------------------
+        // 9. Update UI-only Stage 4 visualization snapshot
+        // --------------------------------------------------------------------
+
+        {
+            std::lock_guard<std::mutex> visualization_lock(
+                    stage4_visualization_mutex);
+
+            latest_stage4_visualization.valid =
+                    result.processed;
+
+            latest_stage4_visualization.processing_ms =
+                    result.processing_ms;
+
+            latest_stage4_visualization.features =
+                    result.features;
+
+            latest_stage4_visualization.tracked =
+                    result.tracked;
+
+            latest_stage4_visualization.inliers =
+                    result.inliers;
+
+            latest_stage4_visualization.local_points =
+                    result.local_points;
+
+            latest_stage4_visualization.pose_valid =
+                    result.pose_valid;
+
+            latest_stage4_visualization.pose_mode =
+                    result.pose_mode;
+
+            latest_stage4_visualization.tx =
+                    result.tx;
+
+            latest_stage4_visualization.ty =
+                    result.ty;
+
+            latest_stage4_visualization.tz =
+                    result.tz;
+
+            latest_stage4_visualization.rgb_width =
+                    width;
+
+            latest_stage4_visualization.rgb_height =
+                    height;
+
+            latest_stage4_visualization.feature_points =
+                    m_previous_points;
+
+            latest_stage4_visualization.local_3d =
+                    local_3d_points;
+        }
+
+        return result;
+    }
+
+private:
+
+    static double elapsedMs(
+            const std::chrono::steady_clock::time_point& start) {
+
+        const auto end =
+                std::chrono::steady_clock::now();
+
+        return std::chrono::duration<double, std::milli>(
+                end - start).count();
+    }
+
+    static bool insideImage(
+            const cv::Point2f& p,
+            int width,
+            int height) {
+
+        return
+                p.x >= 2.0f &&
+                p.y >= 2.0f &&
+                p.x < static_cast<float>(width - 2) &&
+                p.y < static_cast<float>(height - 2);
+    }
+
+    static void limitFeatures(
+            std::vector<cv::Point2f>& points,
+            size_t maximum) {
+
+        if (points.size() <= maximum) {
+            return;
+        }
+
+        points.resize(maximum);
+    }
+
+    int buildLocalDepthPoints(
+            const rs2::depth_frame& depth_frame,
+            const std::vector<cv::Point2f>& points,
+            std::vector<std::array<float, 3>>* output_points = nullptr) {
+
+        if (!depth_frame) {
+            return 0;
+        }
+
+        const int width =
+                depth_frame.get_width();
+
+        const int height =
+                depth_frame.get_height();
+
+        if (width <= 0 || height <= 0) {
+            return 0;
+        }
+
+        const auto* depth_data =
+                static_cast<const uint16_t*>(
+                        depth_frame.get_data());
+
+        if (!depth_data) {
+            return 0;
+        }
+
+        // Use the actual depth scale reported by the D455 depth frame.
+        float depth_scale = 0.001f;
+
+        try {
+
+            depth_scale =
+                    depth_frame.get_units();
+
+        } catch (...) {
+
+            // Keep the D455-compatible fallback if the runtime
+            // cannot expose the depth units.
+            depth_scale = 0.001f;
+        }
+
+        if (depth_scale <= 0.0f) {
+            depth_scale = 0.001f;
+        }
+
+        int valid = 0;
+
+        // Local 3D point processing.
+        // This intentionally uses a small neighborhood around
+        // tracked features instead of constructing the entire
+        // depth point cloud again.
+        for (const auto& p : points) {
+
+            const int x =
+                    static_cast<int>(std::round(p.x));
+
+            const int y =
+                    static_cast<int>(std::round(p.y));
+
+            if (x < 1 ||
+                y < 1 ||
+                x >= width - 1 ||
+                y >= height - 1) {
+                continue;
+            }
+
+            const uint16_t d0 =
+                    depth_data[y * width + x];
+
+            if (d0 == 0) {
+                continue;
+            }
+
+            const float z =
+                    static_cast<float>(d0) *
+                    depth_scale;
+
+            if (z <= 0.05f ||
+                z > 10.0f) {
+                continue;
+            }
+
+            // Lightweight RGB-camera local 3D reconstruction.
+            const float X =
+                    static_cast<float>(
+                            (p.x - m_cx) *
+                            z / m_fx);
+
+            const float Y =
+                    static_cast<float>(
+                            (p.y - m_cy) *
+                            z / m_fy);
+
+            // Optional UI visualization output.
+            // This is the actual depth-backed local 3D point.
+            if (output_points != nullptr) {
+                output_points->push_back({
+                    X,
+                    Y,
+                    z
+                });
+            }
+
+            // Consume the local 3D point through a
+            // small state update. This keeps the local
+            // point processing dynamic without creating
+            // a second full point cloud.
+            m_local_checksum +=
+                    static_cast<double>(X) * 0.001 +
+                    static_cast<double>(Y) * 0.002 +
+                    static_cast<double>(z) * 0.003;
+
+            valid++;
+        }
+
+        return valid;
+    }
+
+    std::mutex m_mutex;
+
+    cv::Mat m_previous_gray;
+
+    std::vector<cv::Point2f>
+            m_previous_points;
+
+    double m_fx = 0.0;
+    double m_fy = 0.0;
+    double m_cx = 0.0;
+    double m_cy = 0.0;
+
+    uint64_t m_frame_count = 0;
+    uint64_t m_keyframe_count = 0;
+
+    double m_local_checksum = 0.0;
+};
+
+static Stage4DynamicTracker g_stage4_dynamic_tracker;
+
+struct Stage2Point {
+    float x;
+    float y;
+    float z;
+};
+
+struct Stage2Voxel {
+    int vx;
+    int vy;
+    int vz;
+};
+
+struct Stage2Result {
+    double processing_ms = 0.0;
+    size_t valid_points = 0;
+    size_t voxel_count = 0;
+
+    // Stage 2.6 frame association.
+    // These identify the RGB/depth frameset used for this Stage 2 snapshot.
+    uint64_t rgb_frame_number = 0;
+    double rgb_timestamp_ms = 0.0;
+    uint64_t depth_frame_number = 0;
+    double depth_timestamp_ms = 0.0;
+
+    // Bounded visualization samples.
+    // These are intentionally much smaller than the complete
+    // decimated point cloud to avoid MethodChannel/UI overhead.
+    std::vector<Stage2Point> visualization_points;
+    std::vector<Stage2Voxel> visualization_voxels;
+};
+
+// Latest Stage 2 snapshot for the dedicated visualization screen.
+// Updated by the streaming thread and read by the JNI/UI thread.
+static std::mutex stage2_visualization_mutex;
+static Stage2Result latest_stage2_result;
+static bool stage2_visualization_valid = false;
+
+static Stage2Result run_stage2_voxel_workload(
+        const rs2::depth_frame& depth_frame,
+        const rs2_intrinsics& stage2_intrinsics) {
+
+    Stage2Result result{};
+
+    const auto start = std::chrono::steady_clock::now();
+
+    if (!depth_frame || !calibration_ready) {
+        return result;
+    }
+
+    const int src_width = depth_frame.get_width();
+    const int src_height = depth_frame.get_height();
+
+    if (src_width <= 0 || src_height <= 0) {
+        return result;
+    }
+
+    // ------------------------------------------------------------------------
+    // Stage 2.3
+    // Decimation
+    //
+    // Keep the full computation at 2x for the baseline.
+    // 4x will be added as a selectable measurement mode later.
+    // ------------------------------------------------------------------------
+
+    const int DECIMATION = stage2_decimation.load();
+
+    const int width = src_width / DECIMATION;
+    const int height = src_height / DECIMATION;
+
+    if (width <= 0 || height <= 0) {
+        return result;
+    }
+
+    // ------------------------------------------------------------------------
+    // Stage 2.4
+    // Single-frame voxel grid
+    //
+    // Current baseline voxel size remains 20 mm so that this rework
+    // does not silently change the existing Stage 2 measurement.
+    // ------------------------------------------------------------------------
+
+    constexpr float VOXEL_SIZE_M = 0.020f;
+
+    std::vector<uint64_t> voxels;
+
+    voxels.reserve(
+            static_cast<size_t>(width) *
+            static_cast<size_t>(height) / 4);
+
+    // Bounded visualization output.
+    constexpr size_t MAX_VIS_POINTS = 3000;
+    constexpr size_t MAX_VIS_VOXELS = 3000;
+
+    result.visualization_points.reserve(MAX_VIS_POINTS);
+    result.visualization_voxels.reserve(MAX_VIS_VOXELS);
+
+    for (int y = 0; y < height; ++y) {
+
+        const int src_y = y * DECIMATION;
+
+        for (int x = 0; x < width; ++x) {
+
+            const int src_x = x * DECIMATION;
+
+            const float depth_m =
+                    depth_frame.get_distance(src_x, src_y);
+
+            if (depth_m <= 0.10f || depth_m >= 10.0f) {
+                continue;
+            }
+
+            float pixel[2] = {
+                    static_cast<float>(src_x),
+                    static_cast<float>(src_y)
+            };
+
+            float point[3] = {};
+
+            rs2_deproject_pixel_to_point(
+                    point,
+                    &stage2_intrinsics,
+                    pixel,
+                    depth_m);
+
+            ++result.valid_points;
+
+            // ---------------------------------------------------------------
+            // Stage 2.2
+            // Retain a bounded 3D point-cloud sample for visualization.
+            //
+            // Deterministic spatial sampling is used instead of random
+            // sampling so live/replay visualization remains comparable.
+            // ---------------------------------------------------------------
+
+            if (result.visualization_points.size() < MAX_VIS_POINTS) {
+
+                // Keep approximately every Nth valid point.
+                constexpr size_t POINT_SAMPLE_STRIDE = 8;
+
+                if ((result.valid_points % POINT_SAMPLE_STRIDE) == 0) {
+
+                    result.visualization_points.push_back({
+                            point[0],
+                            point[1],
+                            point[2]
+                    });
+                }
+            }
+
+            const int vx = static_cast<int>(
+                    std::floor(point[0] / VOXEL_SIZE_M));
+
+            const int vy = static_cast<int>(
+                    std::floor(point[1] / VOXEL_SIZE_M));
+
+            const int vz = static_cast<int>(
+                    std::floor(point[2] / VOXEL_SIZE_M));
+
+            // Pack signed voxel coordinates into a 64-bit key.
+            constexpr int OFFSET = 1000000;
+
+            const uint64_t ux =
+                    static_cast<uint64_t>(
+                            static_cast<int64_t>(vx) + OFFSET);
+
+            const uint64_t uy =
+                    static_cast<uint64_t>(
+                            static_cast<int64_t>(vy) + OFFSET);
+
+            const uint64_t uz =
+                    static_cast<uint64_t>(
+                            static_cast<int64_t>(vz) + OFFSET);
+
+            const uint64_t key =
+                    (ux << 42) |
+                    ((uy & 0x1FFFFFULL) << 21) |
+                    (uz & 0x1FFFFFULL);
+
+            voxels.push_back(key);
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // Single-frame occupied voxel set
+    // ------------------------------------------------------------------------
+
+    std::sort(voxels.begin(), voxels.end());
+
+    voxels.erase(
+            std::unique(voxels.begin(), voxels.end()),
+            voxels.end());
+
+    result.voxel_count = voxels.size();
+
+    // ------------------------------------------------------------------------
+    // Decode a bounded voxel sample for visualization.
+    // ------------------------------------------------------------------------
+
+    constexpr int OFFSET = 1000000;
+
+    const size_t voxel_step =
+            voxels.size() > MAX_VIS_VOXELS
+                    ? (voxels.size() / MAX_VIS_VOXELS)
+                    : 1;
+
+    for (size_t i = 0;
+         i < voxels.size() &&
+         result.visualization_voxels.size() < MAX_VIS_VOXELS;
+         i += voxel_step) {
+
+        const uint64_t key = voxels[i];
+
+        const int64_t ux =
+                static_cast<int64_t>((key >> 42) & 0x3FFFFFULL);
+
+        const int64_t uy =
+                static_cast<int64_t>((key >> 21) & 0x1FFFFFULL);
+
+        const int64_t uz =
+                static_cast<int64_t>(key & 0x1FFFFFULL);
+
+        result.visualization_voxels.push_back({
+                static_cast<int>(ux - OFFSET),
+                static_cast<int>(uy - OFFSET),
+                static_cast<int>(uz - OFFSET)
+        });
+    }
+
+    const auto end = std::chrono::steady_clock::now();
+
+    result.processing_ms =
+            std::chrono::duration<double, std::milli>(
+                    end - start).count();
+
+    return result;
+}
+
+static bool mapColorBoxToDepthBox(
+        float color_left,
+        float color_top,
+        float color_right,
+        float color_bottom,
+        float& depth_left,
+        float& depth_top,
+        float& depth_right,
+        float& depth_bottom) {
+
+    // ------------------------------------------------------------------------
+    // Calibration check
+    // ------------------------------------------------------------------------
+
+    if (!calibration_ready) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "calibration not ready");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Validate RGB bounding box
+    // ------------------------------------------------------------------------
+
+    if (color_right <= color_left ||
+        color_bottom <= color_top) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "invalid RGB bounding box");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Copy latest depth frame safely
+    // ------------------------------------------------------------------------
+
+    std::vector<uint16_t> depth_copy;
+
+    int depth_width = 0;
+    int depth_height = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                latest_depth_mutex);
+
+        if (latest_depth_frame.empty() ||
+            latest_depth_width <= 0 ||
+            latest_depth_height <= 0) {
+
+            LOGE(
+                    "mapColorBoxToDepthBox: "
+                    "no latest depth frame");
+
+            return false;
+        }
+
+        depth_copy =
+                latest_depth_frame;
+
+        depth_width =
+                latest_depth_width;
+
+        depth_height =
+                latest_depth_height;
+    }
+
+    // ------------------------------------------------------------------------
+    // Validate depth buffer
+    // ------------------------------------------------------------------------
+
+    const size_t expected_depth_pixels =
+            static_cast<size_t>(depth_width) *
+            static_cast<size_t>(depth_height);
+
+    if (depth_copy.size() <
+            expected_depth_pixels) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "invalid depth frame size");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Clamp RGB coordinates
+    // ------------------------------------------------------------------------
+
+    const float color_width =
+            static_cast<float>(
+                    color_intrinsics.width);
+
+    const float color_height =
+            static_cast<float>(
+                    color_intrinsics.height);
+
+    color_left =
+            std::clamp(
+                    color_left,
+                    0.0f,
+                    color_width - 1.0f);
+
+    color_top =
+            std::clamp(
+                    color_top,
+                    0.0f,
+                    color_height - 1.0f);
+
+    color_right =
+            std::clamp(
+                    color_right,
+                    0.0f,
+                    color_width - 1.0f);
+
+    color_bottom =
+            std::clamp(
+                    color_bottom,
+                    0.0f,
+                    color_height - 1.0f);
+
+    if (color_right <= color_left ||
+        color_bottom <= color_top) {
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Five RGB points
+    //
+    //       TL ---------------- TR
+    //       |                   |
+    //       |         C         |
+    //       |                   |
+    //       BL ---------------- BR
+    //
+    // Four corners + center.
+    // ------------------------------------------------------------------------
+
+    const float points[5][2] = {
+
+        // Top-left
+        {
+                color_left,
+                color_top
+        },
+
+        // Top-right
+        {
+                color_right,
+                color_top
+        },
+
+        // Bottom-left
+        {
+                color_left,
+                color_bottom
+        },
+
+        // Bottom-right
+        {
+                color_right,
+                color_bottom
+        },
+
+        // Center
+        {
+                (color_left + color_right) * 0.5f,
+                (color_top + color_bottom) * 0.5f
+        }
+    };
+
+    // ------------------------------------------------------------------------
+    // Initialize depth bounding box
+    // ------------------------------------------------------------------------
+
+    float min_x =
+            static_cast<float>(
+                    depth_width);
+
+    float min_y =
+            static_cast<float>(
+                    depth_height);
+
+    float max_x = -1.0f;
+    float max_y = -1.0f;
+
+    int valid_points = 0;
+
+    // ------------------------------------------------------------------------
+    // RGB -> Depth projection
+    // ------------------------------------------------------------------------
+
+    for (int i = 0; i < 5; ++i) {
+
+        const float color_pixel[2] = {
+                points[i][0],
+                points[i][1]
+        };
+
+        float depth_pixel[2] = {
+                0.0f,
+                0.0f
+        };
+
+        /*
+         * Correct 10-argument RealSense API:
+         *
+         * 1  to_pixel
+         * 2  depth
+         * 3  depth_scale
+         * 4  depth_min
+         * 5  depth_max
+         * 6  depth_intrinsics
+         * 7  color_intrinsics
+         * 8  color_to_depth_extrinsics
+         * 9  depth_to_color_extrinsics
+         * 10 from_pixel
+         */
+
+        rs2_project_color_pixel_to_depth_pixel(
+                depth_pixel,
+                depth_copy.data(),
+                depth_scale,
+                0.1f,
+                10.0f,
+                &depth_intrinsics,
+                &color_intrinsics,
+                &color_to_depth_extrinsics,
+                &depth_to_color_extrinsics,
+                color_pixel);
+
+        // --------------------------------------------------------------------
+        // Diagnostic: inspect depth near projected coordinate
+        // --------------------------------------------------------------------
+
+        int sample_x = static_cast<int>(depth_pixel[0]);
+        int sample_y = static_cast<int>(depth_pixel[1]);
+
+        if (sample_x >= 0 &&
+            sample_x < depth_width &&
+            sample_y >= 0 &&
+            sample_y < depth_height) {
+
+            const int sample_index =
+                    sample_y * depth_width + sample_x;
+
+            const uint16_t sample_depth_raw =
+                    depth_copy[sample_index];
+
+            const float sample_depth_m =
+                    sample_depth_raw * depth_scale;
+
+            LOGI(
+                    "Projection depth %d: "
+                    "DepthPixel[%.1f, %.1f] "
+                    "raw=%u distance=%.3f m",
+                    i,
+                    depth_pixel[0],
+                    depth_pixel[1],
+                    sample_depth_raw,
+                    sample_depth_m);
+        } else {
+            LOGI(
+                    "Projection depth %d: "
+                    "DepthPixel[%.1f, %.1f] outside image",
+                    i,
+                    depth_pixel[0],
+                    depth_pixel[1]);
+        }
+
+        // --------------------------------------------------------------------
+        // Validate projected coordinate
+        // --------------------------------------------------------------------
+
+        if (!std::isfinite(depth_pixel[0]) ||
+            !std::isfinite(depth_pixel[1])) {
+
+            LOGI(
+                    "Projection point %d rejected: "
+                    "non-finite Depth[%.1f, %.1f]",
+                    i,
+                    depth_pixel[0],
+                    depth_pixel[1]);
+
+            continue;
+        }
+
+        // --------------------------------------------------------------------
+        // Reject projections outside actual depth image
+        // --------------------------------------------------------------------
+
+        if (depth_pixel[0] < 0.0f ||
+            depth_pixel[0] >= static_cast<float>(depth_width) ||
+            depth_pixel[1] < 0.0f ||
+            depth_pixel[1] >= static_cast<float>(depth_height)) {
+
+            LOGI(
+                    "Projection point %d rejected: "
+                    "RGB[%.1f, %.1f] -> "
+                    "Depth[%.1f, %.1f] outside %dx%d",
+                    i,
+                    color_pixel[0],
+                    color_pixel[1],
+                    depth_pixel[0],
+                    depth_pixel[1],
+                    depth_width,
+                    depth_height);
+
+            continue;
+        }
+
+        // --------------------------------------------------------------------
+        // Reject zero projection
+        // --------------------------------------------------------------------
+
+        if (depth_pixel[0] == 0.0f &&
+            depth_pixel[1] == 0.0f) {
+
+            LOGI(
+                    "Projection point %d rejected: "
+                    "RGB[%.1f, %.1f] -> Depth[0.0, 0.0]",
+                    i,
+                    color_pixel[0],
+                    color_pixel[1]);
+
+            continue;
+        }
+
+        // --------------------------------------------------------------------
+        // Valid projection
+        // --------------------------------------------------------------------
+
+        valid_points++;
+
+        LOGI(
+                "Projection point %d: "
+                "RGB[%.1f, %.1f] -> "
+                "Depth[%.1f, %.1f]",
+                i,
+                color_pixel[0],
+                color_pixel[1],
+                depth_pixel[0],
+                depth_pixel[1]);
+
+        min_x =
+                std::min(
+                        min_x,
+                        depth_pixel[0]);
+
+        min_y =
+                std::min(
+                        min_y,
+                        depth_pixel[1]);
+
+        max_x =
+                std::max(
+                        max_x,
+                        depth_pixel[0]);
+
+        max_y =
+                std::max(
+                        max_y,
+                        depth_pixel[1]);
+    }
+
+    // ------------------------------------------------------------------------
+    // No valid projection
+    // ------------------------------------------------------------------------
+
+    if (valid_points == 0) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "no valid projected points");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Check projected box
+    // ------------------------------------------------------------------------
+
+    if (max_x < 0.0f ||
+        max_y < 0.0f ||
+        min_x >
+                static_cast<float>(
+                        depth_width - 1) ||
+        min_y >
+                static_cast<float>(
+                        depth_height - 1)) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "projected box outside depth image");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Clamp final depth box
+    // ------------------------------------------------------------------------
+
+    depth_left =
+            std::clamp(
+                    min_x,
+                    0.0f,
+                    static_cast<float>(
+                            depth_width - 1));
+
+    depth_top =
+            std::clamp(
+                    min_y,
+                    0.0f,
+                    static_cast<float>(
+                            depth_height - 1));
+
+    depth_right =
+            std::clamp(
+                    max_x,
+                    0.0f,
+                    static_cast<float>(
+                            depth_width - 1));
+
+    depth_bottom =
+            std::clamp(
+                    max_y,
+                    0.0f,
+                    static_cast<float>(
+                            depth_height - 1));
+
+    // ------------------------------------------------------------------------
+    // Validate final box
+    // ------------------------------------------------------------------------
+
+    if (depth_right <= depth_left ||
+        depth_bottom <= depth_top) {
+
+        LOGE(
+                "mapColorBoxToDepthBox: "
+                "invalid mapped depth box");
+
+        return false;
+    }
+
+    // ------------------------------------------------------------------------
+    // Log mapping
+    // ------------------------------------------------------------------------
+
+    LOGI(
+            "RGB->Depth box: "
+            "RGB[%.1f,%.1f,%.1f,%.1f] "
+            "Depth[%.1f,%.1f,%.1f,%.1f] "
+            "valid=%d",
+
+            color_left,
+            color_top,
+            color_right,
+            color_bottom,
+
+            depth_left,
+            depth_top,
+            depth_right,
+            depth_bottom,
+
+            valid_points);
+
+    return true;
+}
+
+
+
+// ============================================================================
+// ============================================================================
+// P3.2.3: DEPTH PIXEL + P3.2.2 MEDIAN DEPTH -> D455 CAMERA XYZ
+// ============================================================================
+
+static bool deprojectDepthPixelToXYZ(
+        float depth_x,
+        float depth_y,
+        float depth_m,
+        float& x_m,
+        float& y_m,
+        float& z_m) {
+
+    x_m = 0.0f;
+    y_m = 0.0f;
+    z_m = 0.0f;
+
+    if (!calibration_ready) {
+        LOGE("P3.2.3: calibration not ready");
+        return false;
+    }
+
+    if (!std::isfinite(depth_x) ||
+        !std::isfinite(depth_y) ||
+        !std::isfinite(depth_m)) {
+
+        LOGE("P3.2.3: invalid pixel/depth input");
+        return false;
+    }
+
+    if (depth_m <= 0.10f ||
+        depth_m >= 10.0f) {
+
+        LOGE(
+                "P3.2.3: invalid depth %.3f m",
+                depth_m);
+
+        return false;
+    }
+
+    const float pixel[2] = {
+            depth_x,
+            depth_y
+    };
+
+    float point[3] = {};
+
+    rs2_deproject_pixel_to_point(
+            point,
+            &depth_intrinsics,
+            pixel,
+            depth_m);
+
+    if (!std::isfinite(point[0]) ||
+        !std::isfinite(point[1]) ||
+        !std::isfinite(point[2])) {
+
+        LOGE(
+                "P3.2.3: deprojection returned "
+                "non-finite XYZ");
+
+        return false;
+    }
+
+    x_m = point[0];
+    y_m = point[1];
+    z_m = point[2];
+
+    LOGI(
+            "P3.2.3: center=(%.1f,%.1f) "
+            "depth=%.3f m XYZ=[%.3f,%.3f,%.3f]",
+            depth_x,
+            depth_y,
+            depth_m,
+            x_m,
+            y_m,
+            z_m);
+
+    return true;
+}
+
+// ============================================================================
+// P3.2.5: OBJECT XYZ -> GROUND-PLANE CROSS-CHECK
+// ============================================================================
+
+static bool checkP325ObjectAgainstGroundPlane(
+        float x_m,
+        float y_m,
+        float z_m,
+        float& plane_distance_m,
+        bool& plane_valid,
+        bool& using_fallback) {
+
+    plane_distance_m = 0.0f;
+    plane_valid = false;
+    using_fallback = false;
+
+    if (!std::isfinite(x_m) ||
+        !std::isfinite(y_m) ||
+        !std::isfinite(z_m)) {
+
+        LOGW("P3.2.5: invalid XYZ input");
+        return false;
+    }
+
+    P31GroundPlane plane;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        plane = latest_ground_plane;
+    }
+
+    plane_valid = plane.valid;
+    using_fallback = plane.using_fallback;
+
+    if (!plane.valid) {
+        LOGW("P3.2.5: ground plane unavailable");
+        return false;
+    }
+
+    const float distance =
+            std::fabs(
+                    plane.nx * x_m +
+                    plane.ny * y_m +
+                    plane.nz * z_m +
+                    plane.d);
+
+    if (!std::isfinite(distance)) {
+        LOGW("P3.2.5: invalid plane distance");
+        return false;
+    }
+
+    plane_distance_m = distance;
+
+    LOGI(
+            "P3.2.5: XYZ=[%.3f,%.3f,%.3f] "
+            "plane_distance=%.3f m valid=%d fallback=%d",
+            x_m,
+            y_m,
+            z_m,
+            plane_distance_m,
+            plane_valid ? 1 : 0,
+            using_fallback ? 1 : 0);
+
+    return true;
+}
+
+
+// ============================================================================
+
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_checkP325ObjectAgainstGroundPlane(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jfloat x_m,
+        jfloat y_m,
+        jfloat z_m) {
+
+    float plane_distance_m = 0.0f;
+    bool plane_valid = false;
+    bool using_fallback = false;
+
+    const bool success =
+            checkP325ObjectAgainstGroundPlane(
+                    x_m,
+                    y_m,
+                    z_m,
+                    plane_distance_m,
+                    plane_valid,
+                    using_fallback);
+
+    if (!success && !plane_valid) {
+        return nullptr;
+    }
+
+    jfloatArray output =
+            env->NewFloatArray(3);
+
+    if (output == nullptr) {
+        return nullptr;
+    }
+
+    const jfloat result[3] = {
+            plane_distance_m,
+            plane_valid ? 1.0f : 0.0f,
+            using_fallback ? 1.0f : 0.0f
+    };
+
+    env->SetFloatArrayRegion(
+            output,
+            0,
+            3,
+            result);
+
+    return output;
+}
+
+// ============================================================================
+
+// ============================================================================
+
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_deprojectDepthPixelToXYZ(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jfloat depth_x,
+        jfloat depth_y,
+        jfloat depth_m) {
+
+    float x_m = 0.0f;
+    float y_m = 0.0f;
+    float z_m = 0.0f;
+
+    const bool success =
+            deprojectDepthPixelToXYZ(
+                    depth_x,
+                    depth_y,
+                    depth_m,
+                    x_m,
+                    y_m,
+                    z_m);
+
+    if (!success) {
+        return nullptr;
+    }
+
+    jfloatArray output =
+            env->NewFloatArray(3);
+
+    if (output == nullptr) {
+        return nullptr;
+    }
+
+    const jfloat xyz[3] = {
+            x_m,
+            y_m,
+            z_m
+    };
+
+    env->SetFloatArrayRegion(
+            output,
+            0,
+            3,
+            xyz);
+
+    return output;
+}
+
+// ============================================================================
+// JNI BRIDGE: RGB BOX -> DEPTH BOX
+// ============================================================================
+
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_mapColorBoxToDepthBox(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jfloat left,
+        jfloat top,
+        jfloat right,
+        jfloat bottom) {
+
+    float depth_left = 0.0f;
+    float depth_top = 0.0f;
+    float depth_right = 0.0f;
+    float depth_bottom = 0.0f;
+
+    const bool success =
+            mapColorBoxToDepthBox(
+                    left,
+                    top,
+                    right,
+                    bottom,
+                    depth_left,
+                    depth_top,
+                    depth_right,
+                    depth_bottom);
+
+    if (!success) {
+
+        LOGE(
+                "mapColorBoxToDepthBox JNI failed");
+
+        return nullptr;
+    }
+
+    jfloatArray output =
+            env->NewFloatArray(4);
+
+    if (output == nullptr) {
+
+        LOGE(
+                "Failed to allocate depth box array");
+
+        return nullptr;
+    }
+
+    const jfloat values[4] = {
+            depth_left,
+            depth_top,
+            depth_right,
+            depth_bottom
+    };
+
+    env->SetFloatArrayRegion(
+            output,
+            0,
+            4,
+            values);
+
+    LOGI(
+            "JNI RGB->Depth box: "
+            "RGB[%.1f, %.1f, %.1f, %.1f] "
+            "Depth[%.1f, %.1f, %.1f, %.1f]",
+
+            left,
+            top,
+            right,
+            bottom,
+
+            depth_left,
+            depth_top,
+            depth_right,
+            depth_bottom);
+
+    return output;
+}
+
+// ============================================================================
+// Forward declare internal librealsense USB device injection method
+// ============================================================================
+
+extern "C" void
+Java_com_intel_realsense_librealsense_DeviceWatcher_nAddUsbDevice(
+        JNIEnv *env,
+        jclass type,
+        jstring deviceName,
+        jint fileDescriptor);
+
+// ============================================================================
+// INIT REALSENSE
+// ============================================================================
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_initRealSenseWithFD(
+        JNIEnv* env,
+        jobject /* this */,
+        jint fd,
+        jstring usbfsPath) {
+
+    const char *path =
+            env->GetStringUTFChars(
+                    usbfsPath,
+                    nullptr);
+
+    LOGI(
+            "Init RealSense with FD: %d, Path: %s",
+            fd,
+            path);
+
+    try {
+
+        if (!rs_ctx) {
+
+            rs_ctx =
+                    std::make_unique<rs2::context>();
+
+            LOGI(
+                    "librealsense2 context instantiated successfully!");
+        }
+
+        Java_com_intel_realsense_librealsense_DeviceWatcher_nAddUsbDevice(
+                env,
+                nullptr,
+                usbfsPath,
+                fd);
+
+        LOGI(
+                "Successfully injected USB FD into rsusb backend!");
+
+    } catch (const std::exception& e) {
+
+        LOGE(
+                "Error: %s",
+                e.what());
+
+        env->ReleaseStringUTFChars(
+                usbfsPath,
+                path);
+
+        return JNI_FALSE;
+    }
+
+    env->ReleaseStringUTFChars(
+            usbfsPath,
+            path);
+
+    isCameraInitialized = true;
+
+    return JNI_TRUE;
+}
+
+
+// ============================================================================
+// D455 CAMERA <-> IMU CALIBRATION QUERY
+// ============================================================================
+
+bool queryD455VioCalibration(
+    const rs2::pipeline_profile& pipeline_profile)
+{
+    LOGI("VIO CALIB TRACE: ENTER queryD455VioCalibration()");
+
+    try
+    {
+        auto* d455_motion =
+            librealsense::ds5_motion::get_active_vio_instance();
+
+        auto* d455_color =
+            librealsense::get_active_d455_vio_color_instance();
+
+        if (!d455_motion || !d455_color)
+        {
+            LOGI(
+                "VIO CALIB TRACE: active instance missing motion=%s color=%s",
+                d455_motion ? "VALID" : "NULL",
+                d455_color ? "VALID" : "NULL");
+            return false;
+        }
+
+        LOGI(
+            "VIO CALIB TRACE: active ds5_motion + ds5_color obtained");
+
+        rs2_extrinsics color_to_depth{};
+        rs2_extrinsics depth_to_imu{};
+
+        LOGI(
+            "VIO CALIB TRACE: BEFORE color_to_depth accessor");
+
+        const bool color_depth_ok =
+            d455_color->get_vio_color_to_depth_extrinsics(
+                color_to_depth);
+
+        LOGI(
+            "VIO CALIB TRACE: AFTER color_to_depth accessor result=%s",
+            color_depth_ok ? "SUCCESS" : "FAILED");
+
+        if (!color_depth_ok)
+        {
+            LOGI(
+                "VIO CALIB TRACE: color_to_depth accessor failed");
+            return false;
+        }
+
+        LOGI(
+            "VIO_COLOR_TO_DEPTH: t=[%.6f %.6f %.6f]",
+            color_to_depth.translation[0],
+            color_to_depth.translation[1],
+            color_to_depth.translation[2]);
+
+        LOGI(
+            "VIO CALIB TRACE: BEFORE depth_to_imu accessor");
+
+        const bool depth_imu_ok =
+            d455_motion->get_vio_depth_to_imu_extrinsics(
+                depth_to_imu);
+
+        LOGI(
+            "VIO CALIB TRACE: AFTER depth_to_imu accessor result=%s",
+            depth_imu_ok ? "SUCCESS" : "FAILED");
+
+        if (!depth_imu_ok)
+        {
+            LOGI(
+                "VIO CALIB TRACE: depth_to_imu accessor failed");
+            return false;
+        }
+
+        LOGI(
+            "VIO_DEPTH_TO_IMU: t=[%.6f %.6f %.6f]",
+            depth_to_imu.translation[0],
+            depth_to_imu.translation[1],
+            depth_to_imu.translation[2]);
+
+        // Compose Color -> Depth and Depth -> IMU:
+        //
+        // R_ci = R_di * R_cd
+        // t_ci = R_di * t_cd + t_di
+
+        rs2_extrinsics color_to_imu{};
+
+        for (int r = 0; r < 3; ++r)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                color_to_imu.rotation[r * 3 + c] = 0.0f;
+
+                for (int k = 0; k < 3; ++k)
+                {
+                    color_to_imu.rotation[r * 3 + c] +=
+                        depth_to_imu.rotation[r * 3 + k] *
+                        color_to_depth.rotation[k * 3 + c];
+                }
+            }
+        }
+
+        for (int r = 0; r < 3; ++r)
+        {
+            color_to_imu.translation[r] =
+                depth_to_imu.translation[r];
+
+            for (int k = 0; k < 3; ++k)
+            {
+                color_to_imu.translation[r] +=
+                    depth_to_imu.rotation[r * 3 + k] *
+                    color_to_depth.translation[k];
+            }
+        }
+
+        LOGI(
+            "VIO_COLOR_TO_IMU: t=[%.6f %.6f %.6f]",
+            color_to_imu.translation[0],
+            color_to_imu.translation[1],
+            color_to_imu.translation[2]);
+
+        LOGI(
+            "VIO CALIB TRACE: Color->Depth + Depth->IMU composition SUCCESS");
+
+        return true;
+    }
+    catch (const rs2::error& e)
+    {
+        LOGI(
+            "VIO CALIB TRACE: RealSense error: %s",
+            e.what());
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        LOGI(
+            "VIO CALIB TRACE: std::exception: %s",
+            e.what());
+        return false;
+    }
+    catch (...)
+    {
+        LOGI(
+            "VIO CALIB TRACE: unknown exception");
+        return false;
+    }
+}
+
+bool startD455ImuSensor()
+{
+    LOGI("D455 IMU TRACE: ENTER startD455ImuSensor()");
+
+    if (!rs_ctx) {
+        LOGE("IMU start skipped: RealSense context unavailable");
+        return false;
+    }
+
+    try {
+        auto devices = rs_ctx->query_devices();
+
+        if (devices.size() == 0) {
+            LOGE("IMU start failed: no RealSense device found");
+            return false;
+        }
+
+        rs2::device device = devices.front();
+
+        auto sensors = device.query_sensors();
+
+        for (auto&& sensor : sensors) {
+
+            rs2::motion_sensor motion =
+                    sensor.as<rs2::motion_sensor>();
+
+            if (!motion) {
+                continue;
+            }
+
+            // Persist the underlying sensor handle so the callback remains active
+            // after startD455ImuSensor() returns.
+            g_d455_motion_sensor = sensor;
+            g_d455_motion_sensor_valid = true;
+
+            auto profiles =
+                    motion.get_stream_profiles();
+
+            rs2::stream_profile selected_gyro;
+            rs2::stream_profile selected_accel;
+
+            LOGI(
+                    "D455 IMU available profiles: count=%zu",
+                    profiles.size());
+
+            for (auto&& profile : profiles) {
+
+                LOGI(
+                        "IMU profile: stream=%d format=%d fps=%d index=%d",
+                        static_cast<int>(profile.stream_type()),
+                        static_cast<int>(profile.format()),
+                        profile.fps(),
+                        profile.stream_index());
+
+                if (profile.stream_type() == RS2_STREAM_GYRO &&
+                    profile.format() == RS2_FORMAT_MOTION_XYZ32F) {
+
+                    if (!selected_gyro ||
+                        profile.fps() > selected_gyro.fps()) {
+
+                        selected_gyro = profile;
+                    }
+                }
+
+                if (profile.stream_type() == RS2_STREAM_ACCEL &&
+                    profile.format() == RS2_FORMAT_MOTION_XYZ32F) {
+
+                    if (!selected_accel ||
+                        profile.fps() > selected_accel.fps()) {
+
+                        selected_accel = profile;
+                    }
+                }
+            }
+
+            if (!selected_gyro || !selected_accel) {
+                LOGE(
+                        "IMU profiles not found: gyro=%d accel=%d",
+                        selected_gyro ? 1 : 0,
+                        selected_accel ? 1 : 0);
+                continue;
+            }
+
+            // Persist the selected profiles for VIO calibration/extrinsics queries.
+            g_d455_gyro_profile = selected_gyro;
+            g_d455_accel_profile = selected_accel;
+            g_d455_imu_profiles_valid = true;
+
+            LOGI(
+                    "VIO IMU profiles saved: gyro_fps=%d accel_fps=%d",
+                    selected_gyro.fps(),
+                    selected_accel.fps());
+
+            std::vector<rs2::stream_profile> imu_profiles;
+            imu_profiles.push_back(selected_gyro);
+            imu_profiles.push_back(selected_accel);
+
+            motion.open(imu_profiles);
+
+            motion.start(
+                    [](rs2::frame frame) {
+
+                try {
+
+                    rs2::motion_frame motion_frame =
+                            frame.as<rs2::motion_frame>();
+
+                    if (!motion_frame) {
+                        return;
+                    }
+
+                    const auto stream_type =
+                            frame.get_profile()
+                                 .stream_type();
+
+                    const double timestamp_ms =
+                            frame.get_timestamp();
+
+                    const rs2_vector motion_data =
+                            motion_frame.get_motion_data();
+
+                    std::lock_guard<std::mutex> lock(
+                            imu_mutex);
+
+                    if (stream_type == RS2_STREAM_GYRO) {
+
+                        latest_gyro_timestamp_ms =
+                                timestamp_ms;
+
+                        latest_gyro_data =
+                                motion_data;
+
+                        // Feed the real D455 gyro sample into VIO.
+                        g_vio_engine.addGyro(
+                                timestamp_ms,
+                                hsv2::Vec3{
+                                        motion_data.x,
+                                        motion_data.y,
+                                        motion_data.z});
+
+                        const auto count =
+                                ++imu_gyro_count;
+
+                        // Store hardware timestamp for nearest frame matching.
+                        gyro_timestamp_buffer.push_back(
+                                {timestamp_ms, count});
+
+                        while (gyro_timestamp_buffer.size() >
+                               IMU_SYNC_BUFFER_SIZE) {
+                            gyro_timestamp_buffer.pop_front();
+                        }
+
+                        if (count == 1 || count % 200 == 0) {
+
+                            LOGI(
+                                    "IMU GYRO samples=%llu "
+                                    "timestamp=%.3f "
+                                    "xyz=[%.4f, %.4f, %.4f]",
+                                    count,
+                                    timestamp_ms,
+                                    motion_data.x,
+                                    motion_data.y,
+                                    motion_data.z);
+                        }
+
+                    } else if (stream_type == RS2_STREAM_ACCEL) {
+
+                        latest_accel_timestamp_ms =
+                                timestamp_ms;
+
+                        latest_accel_data =
+                                motion_data;
+
+                        // Feed the real D455 accelerometer sample into VIO.
+                        g_vio_engine.addAccel(
+                                timestamp_ms,
+                                hsv2::Vec3{
+                                        motion_data.x,
+                                        motion_data.y,
+                                        motion_data.z});
+
+                        const auto count =
+                                ++imu_accel_count;
+
+                        // Store hardware timestamp for nearest frame matching.
+                        accel_timestamp_buffer.push_back(
+                                {timestamp_ms, count});
+
+                        while (accel_timestamp_buffer.size() >
+                               IMU_SYNC_BUFFER_SIZE) {
+                            accel_timestamp_buffer.pop_front();
+                        }
+
+                        if (count == 1 || count % 200 == 0) {
+
+                            LOGI(
+                                    "IMU ACCEL samples=%llu "
+                                    "timestamp=%.3f "
+                                    "xyz=[%.4f, %.4f, %.4f]",
+                                    count,
+                                    timestamp_ms,
+                                    motion_data.x,
+                                    motion_data.y,
+                                    motion_data.z);
+                        }
+                    }
+
+                } catch (const std::exception& e) {
+
+                    LOGE(
+                            "IMU callback exception: %s",
+                            e.what());
+                }
+            });
+
+            imu_streaming = true;
+
+            LOGI(
+                    "D455 IMU sensor started: "
+                    "gyro=200Hz accel=63Hz");
+
+            return true;
+        }
+
+    } catch (const std::exception& e) {
+
+        LOGE(
+                "Failed to start D455 IMU sensor: %s",
+                e.what());
+    }
+
+    return false;
+}
+
+// ============================================================================
+// FIXED TEST SEQUENCE RECORDING
+// ============================================================================
+
+
+// ============================================================================
+// STAGE 4 VISUALIZATION SNAPSHOT
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_getStage4Visualization(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(
+            stage4_visualization_mutex);
+
+    const Stage4VisualizationSnapshot& data =
+            latest_stage4_visualization;
+
+    std::ostringstream json;
+
+    json << std::fixed << std::setprecision(4);
+
+    json << "{";
+
+    json << "\"valid\":"
+         << (data.valid ? "true" : "false") << ",";
+
+    json << "\"processingMs\":"
+         << data.processing_ms << ",";
+
+    json << "\"features\":"
+         << data.features << ",";
+
+    json << "\"tracked\":"
+         << data.tracked << ",";
+
+    json << "\"inliers\":"
+         << data.inliers << ",";
+
+    json << "\"localPoints\":"
+         << data.local_points << ",";
+
+    json << "\"poseValid\":"
+         << (data.pose_valid ? "true" : "false") << ",";
+
+    json << "\"poseMode\":"
+         << data.pose_mode << ",";
+
+    json << "\"tx\":"
+         << data.tx << ",";
+
+    json << "\"ty\":"
+         << data.ty << ",";
+
+    json << "\"tz\":"
+         << data.tz << ",";
+
+    json << "\"rgbWidth\":"
+         << data.rgb_width << ",";
+
+    json << "\"rgbHeight\":"
+         << data.rgb_height << ",";
+
+    // ------------------------------------------------------------------------
+    // 2D feature points
+    // ------------------------------------------------------------------------
+
+    json << "\"features2d\":[";
+
+    for (size_t i = 0;
+         i < data.feature_points.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const cv::Point2f& point =
+                data.feature_points[i];
+
+        json << "["
+             << point.x << ","
+             << point.y
+             << "]";
+    }
+
+    json << "],";
+
+    // ------------------------------------------------------------------------
+    // Depth-backed local 3D points
+    // ------------------------------------------------------------------------
+
+    json << "\"local3d\":[";
+
+    for (size_t i = 0;
+         i < data.local_3d.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const std::array<float, 3>& point =
+                data.local_3d[i];
+
+        json << "["
+             << point[0] << ","
+             << point[1] << ","
+             << point[2]
+             << "]";
+    }
+
+    json << "]";
+
+    json << "}";
+
+    return env->NewStringUTF(
+            json.str().c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_startFixedRecording(
+        JNIEnv* env,
+        jobject /* this */,
+        jstring filesDir) {
+
+    std::lock_guard<std::mutex> lock(recorder_mutex);
+
+    if (fixed_recording) {
+        LOGI("FIXED_RECORDING already active");
+        return;
+    }
+
+    if (filesDir == nullptr) {
+        LOGE("FIXED_RECORDING: filesDir is null");
+        return;
+    }
+
+    const char* path = env->GetStringUTFChars(filesDir, nullptr);
+
+    if (path == nullptr) {
+        LOGE("FIXED_RECORDING: failed to read filesDir");
+        return;
+    }
+
+    fixed_recording_dir =
+            std::string(path) + "/fixed_sequence";
+
+    env->ReleaseStringUTFChars(filesDir, path);
+
+    try {
+
+        mkdir(
+                fixed_recording_dir.c_str(),
+                0700);
+
+        fixed_rgb_file.open(
+                fixed_recording_dir + "/rgb.bin",
+                std::ios::binary | std::ios::trunc);
+
+        fixed_depth_file.open(
+                fixed_recording_dir + "/depth.bin",
+                std::ios::binary | std::ios::trunc);
+
+        fixed_metadata_file.open(
+                fixed_recording_dir + "/metadata.csv",
+                std::ios::out | std::ios::trunc);
+
+        if (!fixed_rgb_file.is_open() ||
+            !fixed_depth_file.is_open() ||
+            !fixed_metadata_file.is_open()) {
+
+            LOGE(
+                    "FIXED_RECORDING: failed to open output files");
+
+            if (fixed_rgb_file.is_open())
+                fixed_rgb_file.close();
+
+            if (fixed_depth_file.is_open())
+                fixed_depth_file.close();
+
+            if (fixed_metadata_file.is_open())
+                fixed_metadata_file.close();
+
+            return;
+        }
+
+        fixed_metadata_file
+                << "frame_index,"
+                << "rgb_frame_number,"
+                << "rgb_timestamp_ms,"
+                << "depth_frame_number,"
+                << "depth_timestamp_ms,"
+                << "rgb_width,"
+                << "rgb_height,"
+                << "depth_width,"
+                << "depth_height,"
+                << "record_elapsed_ms\n";
+
+        fixed_recording_frame_count = 0;
+
+        fixed_recording_start_time =
+                std::chrono::steady_clock::now();
+
+        fixed_recording = true;
+
+        // Start IMU-to-frame timestamp logging in the same fixed-sequence directory.
+        LOGI("IMU_SYNC: about to start logger, dir=%s",
+             fixed_recording_dir.c_str());
+        startImuSyncLogger(fixed_recording_dir);
+
+        LOGI(
+                "FIXED_RECORDING STARTED "
+                "duration=%d sec "
+                "dir=%s",
+                FIXED_RECORDING_DURATION_SEC,
+                fixed_recording_dir.c_str());
+
+    } catch (const std::exception& e) {
+
+        LOGE(
+                "FIXED_RECORDING start exception: %s",
+                e.what());
+
+        if (fixed_rgb_file.is_open())
+            fixed_rgb_file.close();
+
+        if (fixed_depth_file.is_open())
+            fixed_depth_file.close();
+
+        if (fixed_metadata_file.is_open())
+            fixed_metadata_file.close();
+    }
+}
+
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_stopFixedRecording(
+        JNIEnv* /* env */,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(recorder_mutex);
+
+    if (!fixed_recording) {
+        LOGI("FIXED_RECORDING is not active");
+        return;
+    }
+
+    fixed_recording = false;
+
+    // Stop and flush IMU-to-frame timestamp logging.
+    stopImuSyncLogger();
+
+    if (fixed_rgb_file.is_open())
+        fixed_rgb_file.close();
+
+    if (fixed_depth_file.is_open())
+        fixed_depth_file.close();
+
+    if (fixed_metadata_file.is_open())
+        fixed_metadata_file.close();
+
+    LOGI(
+            "FIXED_RECORDING STOPPED "
+            "frames=%llu "
+            "dir=%s",
+            fixed_recording_frame_count,
+            fixed_recording_dir.c_str());
+}
+
+
+// ============================================================================
+// EXPORT FIXED TEST SEQUENCE
+// ============================================================================
+//
+// Copies the completed recording from app-private storage to Download
+// so it can be retrieved with adb.
+//
+
+extern "C" JNIEXPORT jboolean JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_exportFixedRecording(
+        JNIEnv* env,
+        jobject /* this */,
+        jstring destinationDir) {
+
+    try {
+
+        const std::string source_dir =
+                fixed_recording_dir;
+
+        const char* destination_path =
+                env->GetStringUTFChars(
+                        destinationDir,
+                        nullptr);
+
+        if (destination_path == nullptr) {
+            LOGE("FIXED_EXPORT: destination path is null");
+            return JNI_FALSE;
+        }
+
+        const std::string destination_dir =
+                std::string(destination_path) +
+                "/HSV2_fixed_sequence";
+
+        env->ReleaseStringUTFChars(
+                destinationDir,
+                destination_path);
+
+        mkdir(
+                destination_dir.c_str(),
+                0777);
+
+        const std::string files[] = {
+                "rgb.bin",
+                "depth.bin",
+                "metadata.csv",
+                "imu_frame_sync.csv"
+        };
+
+        for (const auto& file : files) {
+
+            const std::string source =
+                    source_dir + "/" + file;
+
+            const std::string destination =
+                    destination_dir + "/" + file;
+
+            std::ifstream input(
+                    source,
+                    std::ios::binary);
+
+            if (!input.is_open()) {
+
+                LOGE(
+                        "FIXED_EXPORT: failed to open %s",
+                        source.c_str());
+
+                return JNI_FALSE;
+            }
+
+            std::ofstream output(
+                    destination,
+                    std::ios::binary |
+                    std::ios::trunc);
+
+            if (!output.is_open()) {
+
+                LOGE(
+                        "FIXED_EXPORT: failed to create %s",
+                        destination.c_str());
+
+                return JNI_FALSE;
+            }
+
+            output << input.rdbuf();
+
+            input.close();
+            output.close();
+
+            LOGI(
+                    "FIXED_EXPORT: copied %s",
+                    file.c_str());
+        }
+
+        LOGI(
+                "FIXED_EXPORT: SUCCESS destination=%s",
+                destination_dir.c_str());
+
+        return JNI_TRUE;
+
+    } catch (const std::exception& e) {
+
+        LOGE(
+                "FIXED_EXPORT exception: %s",
+                e.what());
+
+        return JNI_FALSE;
+    }
+}
+
+// ============================================================================
+// START PIPELINE
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    if (isStreaming ||
+        !rs_ctx) {
+
+        return;
+    }
+
+    try {
+
+        rs_pipe =
+                std::make_unique<rs2::pipeline>(
+                        *rs_ctx);
+
+        rs2::config cfg;
+
+        // --------------------------------------------------------------------
+        // COLOR STREAM
+        // --------------------------------------------------------------------
+
+        cfg.enable_stream(
+                RS2_STREAM_COLOR,
+                640,
+                480,
+                RS2_FORMAT_RGBA8,
+                15);
+
+        // --------------------------------------------------------------------
+        // DEPTH STREAM
+        // --------------------------------------------------------------------
+
+        cfg.enable_stream(
+                RS2_STREAM_DEPTH,
+                640,
+                480,
+                RS2_FORMAT_Z16,
+                15);
+
+        // --------------------------------------------------------------------
+        // START PIPELINE
+        // --------------------------------------------------------------------
+
+        rs2::pipeline_profile pipeline_profile =
+                rs_pipe->start(cfg);
+
+        // --------------------------------------------------------------------
+        // START D455 IMU SENSOR SEPARATELY FROM RGB/DEPTH PIPELINE
+        // --------------------------------------------------------------------
+
+        const bool imu_started =
+                startD455ImuSensor();
+
+        LOGI(
+                "D455 IMU start result: %s",
+                imu_started ? "SUCCESS" : "FAILED");
+
+        // --------------------------------------------------------------------
+        // QUERY D455 CAMERA <-> IMU CALIBRATION FOR VIO
+        // --------------------------------------------------------------------
+
+        if (imu_started) {
+            const bool vio_calibration_ok =
+                    queryD455VioCalibration(pipeline_profile);
+
+            LOGI(
+                    "D455 VIO calibration query result: %s",
+                    vio_calibration_ok ? "SUCCESS" : "FAILED");
+        } else {
+            LOGI(
+                    "D455 VIO calibration skipped: IMU startup failed");
+        }
+
+        // --------------------------------------------------------------------
+        // CACHE D455 CALIBRATION
+        // --------------------------------------------------------------------
+
+        try {
+
+            auto color_profile =
+                    pipeline_profile
+                            .get_stream(
+                                    RS2_STREAM_COLOR)
+                            .as<rs2::video_stream_profile>();
+
+            auto depth_profile =
+                    pipeline_profile
+                            .get_stream(
+                                    RS2_STREAM_DEPTH)
+                            .as<rs2::video_stream_profile>();
+
+            auto depth_sensor =
+                    pipeline_profile
+                            .get_device()
+                            .first<rs2::depth_sensor>();
+
+            depth_scale =
+                    depth_sensor.get_depth_scale();
+
+            color_intrinsics =
+                    color_profile.get_intrinsics();
+
+            depth_intrinsics =
+                    depth_profile.get_intrinsics();
+
+            color_to_depth_extrinsics =
+                    color_profile.get_extrinsics_to(
+                            depth_profile);
+
+            depth_to_color_extrinsics =
+                    depth_profile.get_extrinsics_to(
+                            color_profile);
+
+            calibration_ready = true;
+
+            // Initialize VIO using the actual D455 RGB camera intrinsics.
+            const bool vio_initialized =
+                    g_vio_engine.initialize(
+                            color_intrinsics.width,
+                            color_intrinsics.height,
+                            color_intrinsics.fx,
+                            color_intrinsics.fy,
+                            color_intrinsics.ppx,
+                            color_intrinsics.ppy);
+
+            LOGI(
+                    "VIO initialization: %s",
+                    vio_initialized ? "SUCCESS" : "FAILED");
+
+            LOGI(
+                    "D455 calibration ready: "
+                    "color=%dx%d fx=%.2f fy=%.2f "
+                    "depth=%dx%d fx=%.2f fy=%.2f "
+                    "depth_scale=%.6f",
+
+                    color_intrinsics.width,
+                    color_intrinsics.height,
+                    color_intrinsics.fx,
+                    color_intrinsics.fy,
+
+                    depth_intrinsics.width,
+                    depth_intrinsics.height,
+                    depth_intrinsics.fx,
+                    depth_intrinsics.fy,
+
+                    depth_scale);
+
+        } catch (const rs2::error& e) {
+
+            calibration_ready = false;
+
+            LOGE(
+                    "Failed to get D455 calibration: %s",
+                    e.what());
+        }
+
+        isStreaming = true;
+
+        current_fps = 0.0;
+
+        // --------------------------------------------------------------------
+        // STREAM THREAD
+        // --------------------------------------------------------------------
+
+        streamThread =
+                std::thread([]() {
+
+            LOGI(
+                    "Native stream thread started!");
+
+            rs2::colorizer color_map;
+
+            auto last_time =
+                    std::chrono::steady_clock::now();
+
+            int frame_count = 0;
+
+            unsigned long long last_frame_num = 0;
+
+            int total_dropped_frames = 0;
+
+            while (isStreaming) {
+
+                if (currentStage >= 1) {
+
+                    try {
+
+                        const auto frame_loop_start =
+                                std::chrono::steady_clock::now();
+
+                        rs2::frameset frames =
+                                rs_pipe->wait_for_frames(
+                                        5000);
+
+                        const auto frames_received =
+                                std::chrono::steady_clock::now();
+
+                        const double wait_ms =
+                                std::chrono::duration<
+                                        double,
+                                        std::milli>(
+                                        frames_received -
+                                        frame_loop_start)
+                                        .count();
+
+                        rs2::video_frame color_frame =
+                                frames.get_color_frame();
+
+                        rs2::depth_frame depth_frame =
+                                frames.get_depth_frame();
+
+                        // -----------------------------------------------------
+                        // P3.1 GROUND PLANE
+                        // Estimate the ground plane from the current D455
+                        // depth frame. The latest valid plane is retained
+                        // through the configured fallback policy.
+                        // -----------------------------------------------------
+
+                        if (depth_frame) {
+
+                            const auto p31_start =
+                                    std::chrono::steady_clock::now();
+
+                            P31GroundPlane p31_result;
+
+                            const bool p31_valid =
+                                    runP31GroundPlane(
+                                            depth_frame,
+                                            p31_result);
+
+                            const auto p31_end =
+                                    std::chrono::steady_clock::now();
+
+                            const double p31_ms =
+                                    std::chrono::duration<
+                                            double,
+                                            std::milli>(
+                                            p31_end - p31_start)
+                                            .count();
+
+                            if (p31_valid) {
+
+                                LOGI(
+                                        "P31_GROUND: "
+                                        "valid=1 "
+                                        "fallback=%d "
+                                        "inliers=%d "
+                                        "samples=%d "
+                                        "error=%.4f m "
+                                        "plane=[%.4f %.4f %.4f %.4f] "
+                                        "time=%.2f ms",
+                                        p31_result.using_fallback ? 1 : 0,
+                                        p31_result.inliers,
+                                        p31_result.sampled_points,
+                                        p31_result.mean_error_m,
+                                        p31_result.nx,
+                                        p31_result.ny,
+                                        p31_result.nz,
+                                        p31_result.d,
+                                        p31_ms);
+
+                            } else {
+
+                                LOGI(
+                                        "P31_GROUND: "
+                                        "valid=0 "
+                                        "fallback=%d "
+                                        "inliers=%d "
+                                        "samples=%d "
+                                        "error=%.4f m "
+                                        "time=%.2f ms",
+                                        p31_result.using_fallback ? 1 : 0,
+                                        p31_result.inliers,
+                                        p31_result.sampled_points,
+                                        p31_result.mean_error_m,
+                                        p31_ms);
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // ACTUAL VIO RGB INPUT
+                        // Feed the real D455 RGB frame and hardware timestamp
+                        // into the VIO engine.
+                        // -----------------------------------------------------
+
+                        if (color_frame &&
+                            g_vio_engine.isInitialized()) {
+
+                            const bool vio_image_ok =
+                                    g_vio_engine.addImage(
+                                            color_frame.get_timestamp(),
+                                            static_cast<const uint8_t*>(
+                                                    color_frame.get_data()),
+                                            color_frame.get_width(),
+                                            color_frame.get_height());
+
+                            if (currentStage == 4 && vio_image_ok) {
+
+                                const hsv2::VioTiming vio_timing =
+                                        g_vio_engine.getTiming();
+
+                                LOGI(
+                                        "VIO_INPUT: "
+                                        "frame=%llu "
+                                        "timestamp=%.3f "
+                                        "processing=%.3f ms "
+                                        "images=%llu "
+                                        "imu=%llu",
+                                        static_cast<unsigned long long>(
+                                                color_frame.get_frame_number()),
+                                        color_frame.get_timestamp(),
+                                        vio_timing.processing_ms,
+                                        static_cast<unsigned long long>(
+                                                vio_timing.image_count),
+                                        static_cast<unsigned long long>(
+                                                vio_timing.imu_count));
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // LADDER STAGE 4
+                        // VIO-shaped concurrent CPU workload.
+                        // Runs on a separate thread so it overlaps the normal
+                        // D455 + MediaPipe processing pipeline.
+                        // -----------------------------------------------------
+
+                        if (currentStage == 4 &&
+                            color_frame &&
+                            depth_frame) {
+
+                            try {
+
+                                // -------------------------------------------------
+                                // Stage 4 - FAST PATH
+                                //
+                                // Do NOT run rs2::align here.
+                                // rs2::align is too expensive for the live 15 FPS path.
+                                // Stage 4 receives the native D455 depth frame directly.
+                                // -------------------------------------------------
+                                const rs2::depth_frame stage4_depth =
+                                        depth_frame;
+
+                                if (!stage4_depth) {
+
+                                    LOGW(
+                                            "STAGE4_DYNAMIC: "
+                                            "native depth unavailable");
+
+                                } else {
+
+                                    const Stage4DynamicResult stage4 =
+                                            g_stage4_dynamic_tracker.process(
+                                                    color_frame,
+                                                    stage4_depth);
+
+                                if (stage4.processed) {
+
+                                    LOGI(
+                                            "STAGE4_DYNAMIC: "
+                                            "frame=%llu "
+                                            "time=%.2f ms "
+                                            "features=%d "
+                                            "tracked=%d "
+                                            "inliers=%d "
+                                            "local3d=%d "
+                                            "pose=%d "
+                                            "pose_mode=%d "
+                                            "t=[%.4f %.4f %.4f]",
+                                            static_cast<unsigned long long>(
+                                                    color_frame.get_frame_number()),
+                                            stage4.processing_ms,
+                                            stage4.features,
+                                            stage4.tracked,
+                                            stage4.inliers,
+                                            stage4.local_points,
+                                            stage4.pose_valid ? 1 : 0,
+                                            stage4.pose_mode,
+                                            stage4.tx,
+                                            stage4.ty,
+                                            stage4.tz);
+
+                                } else {
+
+                                    LOGI(
+                                            "STAGE4_DYNAMIC: "
+                                            "frame=%llu "
+                                            "dropped_busy=1",
+                                            static_cast<unsigned long long>(
+                                                    color_frame.get_frame_number()));
+                                }
+
+                                }
+
+
+                            } catch (const std::exception& e) {
+
+                                LOGE(
+                                        "STAGE4_DYNAMIC exception: %s",
+                                        e.what());
+
+                            } catch (...) {
+
+                                LOGE(
+                                        "STAGE4_DYNAMIC unknown exception");
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // LADDER STAGE 2
+                        // Decimated depth + 3D deprojection + single-frame
+                        // voxel grid. This adds workload without replacing
+                        // the normal MediaPipe pipeline.
+                        // -----------------------------------------------------
+
+                        if (currentStage == 2 &&
+                            color_frame &&
+                            depth_frame) {
+
+                            try {
+
+                                // -------------------------------------------------
+                                // Stage 2.1 - Depth Alignment
+                                // Align depth into RGB/color coordinates.
+                                // -------------------------------------------------
+                                rs2::frameset aligned_frames =
+                                        stage2_align_to_color.process(frames);
+
+                                rs2::depth_frame aligned_depth =
+                                        aligned_frames.get_depth_frame();
+
+                                if (aligned_depth) {
+
+                                    const int aligned_width =
+                                            aligned_depth.get_width();
+
+                                    const int aligned_height =
+                                            aligned_depth.get_height();
+
+                                    rs2::video_stream_profile aligned_profile =
+                                            aligned_depth
+                                                    .get_profile()
+                                                    .as<rs2::video_stream_profile>();
+
+                                    const rs2_intrinsics aligned_intrinsics =
+                                            aligned_profile.get_intrinsics();
+
+                                    LOGI(
+                                            "STAGE2_ALIGN: "
+                                            "RGB=%dx%d "
+                                            "AlignedDepth=%dx%d",
+                                            color_frame.get_width(),
+                                            color_frame.get_height(),
+                                            aligned_width,
+                                            aligned_height);
+
+                                    // -------------------------------------------------
+                                    // Stage 2.2 -> 2.4
+                                    // 3D deprojection + decimation + voxel grid.
+                                    // -------------------------------------------------
+                                    Stage2Result stage2 =
+                                            run_stage2_voxel_workload(
+                                                    aligned_depth,
+                                                    aligned_intrinsics);
+
+                                    // -------------------------------------------------
+                                    // Stage 2.6 - RGB/3D frame association
+                                    // -------------------------------------------------
+                                    // The Stage 2 visualization snapshot is explicitly
+                                    // associated with this RGB/depth frameset.
+                                    stage2.rgb_frame_number =
+                                            static_cast<uint64_t>(
+                                                    color_frame.get_frame_number());
+
+                                    stage2.rgb_timestamp_ms =
+                                            color_frame.get_timestamp();
+
+                                    stage2.depth_frame_number =
+                                            static_cast<uint64_t>(
+                                                    aligned_depth.get_frame_number());
+
+                                    stage2.depth_timestamp_ms =
+                                            aligned_depth.get_timestamp();
+
+                                    const double stage2_time =
+                                            stage2.processing_ms;
+
+                                    const size_t stage2_points =
+                                            stage2.valid_points;
+
+                                    const size_t stage2_voxels =
+                                            stage2.voxel_count;
+
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                                stage2_visualization_mutex);
+
+                                        latest_stage2_result =
+                                                std::move(stage2);
+
+                                        stage2_visualization_valid = true;
+                                    }
+
+                                    LOGI(
+                                            "STAGE2: "
+                                            "time=%.2f ms "
+                                            "valid_points=%zu "
+                                            "voxels=%zu "
+                                            "aligned=1",
+                                            stage2_time,
+                                            stage2_points,
+                                            stage2_voxels);
+
+                                } else {
+
+                                    LOGW(
+                                            "STAGE2_ALIGN: "
+                                            "aligned depth frame unavailable");
+                                }
+
+                            } catch (const rs2::error& e) {
+
+                                LOGE(
+                                        "STAGE2_ALIGN: "
+                                        "RealSense error: %s",
+                                        e.what());
+
+                            } catch (const std::exception& e) {
+
+                                LOGE(
+                                        "STAGE2_ALIGN: "
+                                        "Exception: %s",
+                                        e.what());
+                            }
+                        }
+
+                        // COPY LATEST DEPTH FRAME
+                        // -----------------------------------------------------
+
+                        if (depth_frame) {
+
+                            const int depth_width =
+                                    depth_frame.get_width();
+
+                            const int depth_height =
+                                    depth_frame.get_height();
+
+                            const size_t depth_pixels =
+                                    static_cast<size_t>(
+                                            depth_width) *
+                                    static_cast<size_t>(
+                                            depth_height);
+
+                            std::lock_guard<std::mutex>
+                                    depth_lock(
+                                            latest_depth_mutex);
+
+                            latest_depth_frame.resize(
+                                    depth_pixels);
+
+                            std::memcpy(
+                                    latest_depth_frame.data(),
+                                    depth_frame.get_data(),
+                                    depth_pixels *
+                                            sizeof(uint16_t));
+
+                            latest_depth_width =
+                                    depth_width;
+
+                            latest_depth_height =
+                                    depth_height;
+
+                            latest_depth_timestamp_ms =
+                                    depth_frame.get_timestamp();
+
+                            latest_depth_frame_num =
+                                    depth_frame.get_frame_number();
+                        }
+
+                        // -----------------------------------------------------
+                        // COPY LATEST RGB FRAME
+                        // -----------------------------------------------------
+
+                        const auto rgb_copy_start =
+                                std::chrono::steady_clock::now();
+
+                        if (color_frame) {
+
+                            const int rgb_width =
+                                    color_frame.get_width();
+
+                            const int rgb_height =
+                                    color_frame.get_height();
+
+                            const size_t rgb_bytes =
+                                    static_cast<size_t>(
+                                            rgb_width) *
+                                    static_cast<size_t>(
+                                            rgb_height) *
+                                    4;
+
+                            std::lock_guard<std::mutex>
+                                    rgb_lock(
+                                            latest_rgb_mutex);
+
+                            latest_rgb_frame.resize(
+                                    rgb_bytes);
+
+                            std::memcpy(
+                                    latest_rgb_frame.data(),
+                                    color_frame.get_data(),
+                                    rgb_bytes);
+
+                            latest_rgb_width =
+                                    rgb_width;
+
+                            latest_rgb_height =
+                                    rgb_height;
+
+                            latest_rgb_timestamp_ms =
+                                    color_frame.get_timestamp();
+
+                            latest_rgb_frame_num =
+                                    color_frame.get_frame_number();
+                        }
+
+                        // -----------------------------------------------------
+                        // FIXED TEST SEQUENCE RECORDING
+                        // -----------------------------------------------------
+                        //
+                        // Record one RGB + Depth pair per frameset.
+                        // The binary files contain raw frame data.
+                        // metadata.csv contains the corresponding RealSense
+                        // hardware timestamps and frame numbers.
+                        //
+
+                        static int fixed_debug_count = 0;
+                        if (fixed_debug_count < 10) {
+                            LOGI(
+                                    "FIXED_DEBUG: recording=%d color=%d depth=%d",
+                                    fixed_recording ? 1 : 0,
+                                    color_frame ? 1 : 0,
+                                    depth_frame ? 1 : 0);
+                            ++fixed_debug_count;
+                        }
+
+                        if (fixed_recording &&
+                            color_frame &&
+                            depth_frame) {
+
+                            std::lock_guard<std::mutex>
+                                    recorder_lock(recorder_mutex);
+
+                            if (fixed_recording) {
+
+                                const auto recording_now =
+                                        std::chrono::steady_clock::now();
+
+                                const double elapsed_ms =
+                                        std::chrono::duration<
+                                                double,
+                                                std::milli>(
+                                                recording_now -
+                                                fixed_recording_start_time)
+                                                .count();
+
+                                if (elapsed_ms <
+                                    FIXED_RECORDING_DURATION_SEC * 1000.0) {
+
+                                    const int record_rgb_width =
+                                            color_frame.get_width();
+
+                                    const int record_rgb_height =
+                                            color_frame.get_height();
+
+                                    const int record_depth_width =
+                                            depth_frame.get_width();
+
+                                    const int record_depth_height =
+                                            depth_frame.get_height();
+
+                                    const size_t record_rgb_bytes =
+                                            static_cast<size_t>(
+                                                    record_rgb_width) *
+                                            static_cast<size_t>(
+                                                    record_rgb_height) *
+                                            4;
+
+                                    const size_t record_depth_bytes =
+                                            static_cast<size_t>(
+                                                    record_depth_width) *
+                                            static_cast<size_t>(
+                                                    record_depth_height) *
+                                            sizeof(uint16_t);
+
+                                    const uint32_t
+                                            rgb_size =
+                                            static_cast<uint32_t>(
+                                                    record_rgb_bytes);
+
+                                    const uint32_t
+                                            depth_size =
+                                            static_cast<uint32_t>(
+                                                    record_depth_bytes);
+
+                                    // Store frame sizes before each raw frame.
+                                    fixed_rgb_file.write(
+                                            reinterpret_cast<const char*>(
+                                                    &rgb_size),
+                                            sizeof(rgb_size));
+
+                                    fixed_rgb_file.write(
+                                            reinterpret_cast<const char*>(
+                                                    color_frame.get_data()),
+                                            record_rgb_bytes);
+
+                                    fixed_depth_file.write(
+                                            reinterpret_cast<const char*>(
+                                                    &depth_size),
+                                            sizeof(depth_size));
+
+                                    fixed_depth_file.write(
+                                            reinterpret_cast<const char*>(
+                                                    depth_frame.get_data()),
+                                            record_depth_bytes);
+
+                                    // Record RGB/depth frame timestamps together with
+                                    // the latest D455 gyro/accelerometer timestamps.
+                                    recordImuFrameSync(
+                                            color_frame,
+                                            depth_frame);
+
+                                    fixed_metadata_file
+                                            << std::fixed
+                                            << std::setprecision(6)
+                                            << fixed_recording_frame_count
+                                            << ","
+                                            << color_frame.get_frame_number()
+                                            << ","
+                                            << color_frame.get_timestamp()
+                                            << ","
+                                            << depth_frame.get_frame_number()
+                                            << ","
+                                            << depth_frame.get_timestamp()
+                                            << ","
+                                            << record_rgb_width
+                                            << ","
+                                            << record_rgb_height
+                                            << ","
+                                            << record_depth_width
+                                            << ","
+                                            << record_depth_height
+                                            << ","
+                                            << elapsed_ms
+                                            << "\n";
+
+                                    ++fixed_recording_frame_count;
+
+                                    if (fixed_recording_frame_count % 30 ==
+                                        0) {
+
+                                        LOGI(
+                                                "FIXED_RECORDING "
+                                                "frames=%llu "
+                                                "elapsed=%.1fs",
+                                                fixed_recording_frame_count,
+                                                elapsed_ms / 1000.0);
+                                    }
+
+                                } else {
+
+                                    fixed_recording = false;
+
+                                    if (fixed_rgb_file.is_open())
+                                        fixed_rgb_file.close();
+
+                                    if (fixed_depth_file.is_open())
+                                        fixed_depth_file.close();
+
+                                    if (fixed_metadata_file.is_open())
+                                        fixed_metadata_file.close();
+
+                                    stopImuSyncLogger();
+
+                                    LOGI(
+                                            "FIXED_RECORDING COMPLETE "
+                                            "frames=%llu "
+                                            "duration=%.1fs "
+                                            "dir=%s",
+                                            fixed_recording_frame_count,
+                                            elapsed_ms / 1000.0,
+                                            fixed_recording_dir.c_str());
+                                }
+                            }
+                        }
+
+                        const auto rgb_copy_end =
+                                std::chrono::steady_clock::now();
+
+                        const double rgb_copy_ms =
+                                std::chrono::duration<
+                                        double,
+                                        std::milli>(
+                                        rgb_copy_end -
+                                        rgb_copy_start)
+                                        .count();
+
+                        // -----------------------------------------------------
+                        // DROPPED FRAME TRACKING
+                        // -----------------------------------------------------
+
+                        unsigned long long current_frame_num =
+                                color_frame.get_frame_number();
+
+                        if (last_frame_num != 0 &&
+                            current_frame_num >
+                                    last_frame_num + 1) {
+
+                            total_dropped_frames +=
+                                    static_cast<int>(
+                                            current_frame_num -
+                                            last_frame_num -
+                                            1);
+                        }
+
+                        last_frame_num =
+                                current_frame_num;
+
+                        // -----------------------------------------------------
+                        // CAMERA-TO-FRAME LATENCY
+                        // -----------------------------------------------------
+
+                        double frame_timestamp_ms =
+                                color_frame.get_timestamp();
+
+                        auto now_sys =
+                                std::chrono::system_clock::now();
+
+                        double sys_time_ms =
+                                std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+                                        now_sys.time_since_epoch())
+                                        .count();
+
+                        double latency =
+                                sys_time_ms -
+                                frame_timestamp_ms;
+
+                        if (latency < 0 ||
+                            latency > 1000) {
+
+                            latency = 16.6;
+                        }
+
+                        // Add this live sample to the rolling latency history.
+                        add_latency_sample(latency);
+
+                        // -----------------------------------------------------
+                        // FPS
+                        // -----------------------------------------------------
+
+                        frame_count++;
+
+                        auto now =
+                                std::chrono::steady_clock::now();
+
+                        auto elapsed =
+                                std::chrono::duration_cast<
+                                        std::chrono::milliseconds>(
+                                        now - last_time)
+                                        .count();
+
+                        if (elapsed >= 1000) {
+
+                            current_fps =
+                                    (frame_count * 1000.0) /
+                                    elapsed;
+
+                            frame_count = 0;
+
+                            last_time = now;
+                        }
+
+                        // -----------------------------------------------------
+                        // RGB RENDER
+                        // -----------------------------------------------------
+
+                        double rgb_render_ms = 0.0;
+
+                        if (nativeWindow &&
+                            color_frame) {
+
+                            const auto rgb_render_start =
+                                    std::chrono::steady_clock::now();
+
+                            ANativeWindow_Buffer buffer;
+
+                            if (ANativeWindow_lock(
+                                        nativeWindow,
+                                        &buffer,
+                                        nullptr) == 0) {
+
+                                int width =
+                                        color_frame.get_width();
+
+                                int height =
+                                        color_frame.get_height();
+
+                                if (buffer.width >= width &&
+                                    buffer.height >= height) {
+
+                                    uint8_t* out =
+                                            static_cast<uint8_t*>(
+                                                    buffer.bits);
+
+                                    const uint8_t* in =
+                                            static_cast<const uint8_t*>(
+                                                    color_frame.get_data());
+
+                                    for (int y = 0;
+                                         y < height;
+                                         ++y) {
+
+                                        memcpy(
+                                                out +
+                                                y *
+                                                        buffer.stride *
+                                                        4,
+
+                                                in +
+                                                y *
+                                                        width *
+                                                        4,
+
+                                                width * 4);
+                                    }
+                                }
+
+                                // -------------------------------------------------
+                                // DEPTH
+                                // -------------------------------------------------
+
+                                float center_distance =
+                                        0.0f;
+
+                                double depth_render_ms =
+                                        0.0;
+
+                                if (depth_frame) {
+
+                                    int dwidth =
+                                            depth_frame.get_width();
+
+                                    int dheight =
+                                            depth_frame.get_height();
+
+                                    // Robust center distance:
+                                    // Use an 11x11 ROI and median of valid depth
+                                    // samples instead of a single depth pixel.
+                                    center_distance = 0.0f;
+
+                                    const int cx = dwidth / 2;
+                                    const int cy = dheight / 2;
+
+                                    std::vector<float> center_depths;
+                                    center_depths.reserve(121);
+
+                                    for (int dy = -5; dy <= 5; ++dy) {
+                                        for (int dx = -5; dx <= 5; ++dx) {
+
+                                            const int x = cx + dx;
+                                            const int y = cy + dy;
+
+                                            if (x < 0 || x >= dwidth ||
+                                                y < 0 || y >= dheight) {
+                                                continue;
+                                            }
+
+                                            const float d =
+                                                    depth_frame.get_distance(x, y);
+
+                                            // Valid D455 depth only:
+                                            // 10 cm to 10 m.
+                                            if (std::isfinite(d) &&
+                                                d >= 0.10f &&
+                                                d <= 10.0f) {
+                                                center_depths.push_back(d);
+                                            }
+                                        }
+                                    }
+
+                                    if (!center_depths.empty()) {
+                                        std::sort(
+                                                center_depths.begin(),
+                                                center_depths.end());
+
+                                        center_distance =
+                                                center_depths[
+                                                        center_depths.size() / 2];
+                                    }
+
+                                    if (depthNativeWindow) {
+
+                                        const auto depth_start =
+                                                std::chrono::steady_clock::now();
+
+                                        rs2::frame colorized_depth =
+                                                color_map.process(
+                                                        depth_frame);
+
+                                        ANativeWindow_Buffer dbuffer;
+
+                                        if (ANativeWindow_lock(
+                                                    depthNativeWindow,
+                                                    &dbuffer,
+                                                    nullptr) == 0) {
+
+                                            if (dbuffer.width >= dwidth &&
+                                                dbuffer.height >= dheight) {
+
+                                                const uint8_t* in =
+                                                        static_cast<
+                                                                const uint8_t*>(
+                                                                colorized_depth
+                                                                        .get_data());
+
+                                                uint8_t* out =
+                                                        static_cast<uint8_t*>(
+                                                                dbuffer.bits);
+
+                                                for (int y = 0;
+                                                     y < dheight;
+                                                     ++y) {
+
+                                                    for (int x = 0;
+                                                         x < dwidth;
+                                                         ++x) {
+
+                                                        int out_idx =
+                                                                y *
+                                                                        dbuffer.stride *
+                                                                        4 +
+                                                                x * 4;
+
+                                                        int in_idx =
+                                                                y *
+                                                                        dwidth *
+                                                                        3 +
+                                                                x * 3;
+
+                                                        out[out_idx + 0] =
+                                                                in[in_idx + 0];
+
+                                                        out[out_idx + 1] =
+                                                                in[in_idx + 1];
+
+                                                        out[out_idx + 2] =
+                                                                in[in_idx + 2];
+
+                                                        out[out_idx + 3] =
+                                                                255;
+                                                    }
+                                                }
+                                            }
+
+                                            ANativeWindow_unlockAndPost(
+                                                    depthNativeWindow);
+                                        }
+
+                                        const auto depth_end =
+                                                std::chrono::steady_clock::now();
+
+                                        depth_render_ms =
+                                                std::chrono::duration<
+                                                        double,
+                                                        std::milli>(
+                                                        depth_end -
+                                                        depth_start)
+                                                        .count();
+                                    }
+                                }
+
+                                // -------------------------------------------------
+                                // TELEMETRY
+                                // -------------------------------------------------
+
+                                std::string detections_json =
+                                        "[]";
+
+                                std::lock_guard<std::mutex> lock(
+                                        telemetry_mutex);
+
+                                std::ostringstream telemetry_stream;
+                                telemetry_stream
+                                        << "{\"fps\": " << std::fixed << std::setprecision(1)
+                                        << current_fps.load()
+                                        << ", \"p50\": " << read_latency_p50()
+                                        << ", \"p95\": " << read_latency_p95()
+                                        << ", \"p99\": " << read_latency_p99()
+                                        << ", \"cpuClockMhz\": " << read_cpu_clock_max_mhz()
+                                        << ", \"thermal\": " << read_max_thermal_celsius()
+                                        << ", \"cpuThermalZones\": "
+                                        << read_cpu_thermal_zones_json()
+                                        << ", \"battery\": " << read_battery_percent()
+                                        << ", \"centerDistance\": " << std::setprecision(2)
+                                        << latency
+                                        << ", \"droppedFrames\": " << total_dropped_frames
+                                        << ", \"imu\": {"
+                                        << "\"gyro\": ["
+                                        << std::setprecision(5)
+                                        << latest_gyro_data.x << ", "
+                                        << latest_gyro_data.y << ", "
+                                        << latest_gyro_data.z << "], "
+                                        << "\"accel\": ["
+                                        << latest_accel_data.x << ", "
+                                        << latest_accel_data.y << ", "
+                                        << latest_accel_data.z << "], "
+                                        << "\"gyroTimestampMs\": "
+                                        << std::setprecision(3)
+                                        << latest_gyro_timestamp_ms
+                                        << ", \"accelTimestampMs\": "
+                                        << latest_accel_timestamp_ms
+                                        << ", \"gyroCount\": "
+                                        << static_cast<unsigned long long>(
+                                                imu_gyro_count.load())
+                                        << ", \"accelCount\": "
+                                        << static_cast<unsigned long long>(
+                                                imu_accel_count.load())
+                                        << "}, "
+                                        << "\"detections\": "
+                                        << detections_json
+                                        << "}";
+
+                                std::string telemetry_string =
+                                        telemetry_stream.str();
+
+                                std::snprintf(
+                                        telemetry_json,
+                                        sizeof(telemetry_json),
+                                        "%s",
+                                        telemetry_string.c_str());
+
+                                ANativeWindow_unlockAndPost(
+                                        nativeWindow);
+
+                                const auto rgb_render_end =
+                                        std::chrono::steady_clock::now();
+
+                                rgb_render_ms =
+                                        std::chrono::duration<
+                                                double,
+                                                std::milli>(
+                                                rgb_render_end -
+                                                rgb_render_start)
+                                                .count();
+
+                                // -------------------------------------------------
+                                // TOTAL FRAME LOOP TIMING
+                                // -------------------------------------------------
+
+                                const auto frame_loop_end =
+                                        std::chrono::steady_clock::now();
+
+                                const double total_loop_ms =
+                                        std::chrono::duration<
+                                                double,
+                                                std::milli>(
+                                                frame_loop_end -
+                                                frame_loop_start)
+                                                .count();
+
+                                LOGI(
+                                        "FRAME_TIMING "
+                                        "wait=%.1fms "
+                                        "rgb_copy=%.1fms "
+                                        "rgb_render=%.1fms "
+                                        "depth_render=%.1fms "
+                                        "total=%.1fms "
+                                        "fps=%.1f",
+
+                                        wait_ms,
+
+                                        rgb_copy_ms,
+
+                                        rgb_render_ms,
+
+                                        depth_render_ms,
+
+                                        total_loop_ms,
+
+                                        current_fps.load());
+                            }
+                        }
+
+                    } catch (const std::exception& e) {
+
+                        LOGE(
+                                "Frame loop exception: %s",
+                                e.what());
+                    }
+                }
+            }
+
+            LOGI(
+                    "Native stream thread stopped!");
+        });
+
+    } catch (const std::exception& e) {
+
+        LOGE(
+                "Failed to start pipeline: %s",
+                e.what());
+    }
+}
+
+// ============================================================================
+// CAPTURE CURRENT RGB FRAME
+// ============================================================================
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_captureCurrentRgbFrame(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::vector<uint8_t> frame_copy;
+
+    int width = 0;
+    int height = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                latest_rgb_mutex);
+
+        if (latest_rgb_frame.empty()) {
+
+            LOGE(
+                    "captureCurrentRgbFrame: "
+                    "no latest RGB frame available");
+
+            return nullptr;
+        }
+
+        frame_copy =
+                latest_rgb_frame;
+
+        width =
+                latest_rgb_width;
+
+        height =
+                latest_rgb_height;
+    }
+
+    const size_t byte_count =
+            frame_copy.size();
+
+    jbyteArray result =
+            env->NewByteArray(
+                    static_cast<jsize>(
+                            byte_count));
+
+    if (!result) {
+
+        LOGE(
+                "captureCurrentRgbFrame: "
+                "failed to allocate byte array");
+
+        return nullptr;
+    }
+
+    env->SetByteArrayRegion(
+            result,
+            0,
+            static_cast<jsize>(
+                    byte_count),
+            reinterpret_cast<const jbyte*>(
+                    frame_copy.data()));
+
+    LOGI(
+            "captureCurrentRgbFrame: "
+            "latest frame %dx%d, %zu bytes",
+            width,
+            height,
+            byte_count);
+
+    return result;
+}
+
+// ============================================================================
+// STOP PIPELINE
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_stopPipeline(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    if (!isStreaming)
+        return;
+
+    isStreaming = false;
+
+    if (streamThread.joinable()) {
+
+        streamThread.join();
+    }
+
+    if (rs_pipe) {
+
+        try {
+
+            rs_pipe->stop();
+
+        } catch (...) {}
+
+        rs_pipe.reset();
+    }
+}
+
+// ============================================================================
+// SET STAGE 2 DECIMATION
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setStage2Decimation(
+        JNIEnv* env,
+        jobject /* this */,
+        jint decimation) {
+
+    if (decimation != 2 && decimation != 4) {
+        LOGW(
+                "Invalid Stage 2 decimation %d; keeping %d",
+                decimation,
+                stage2_decimation.load());
+        return;
+    }
+
+    stage2_decimation.store(decimation);
+
+    LOGI(
+            "Stage 2 decimation set to %d",
+            decimation);
+}
+
+// ============================================================================
+// SET STAGE
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setStage(
+        JNIEnv* env,
+        jobject /* this */,
+        jint stage) {
+
+    currentStage = stage;
+
+    LOGI(
+            "Pipeline Stage set to %d",
+            currentStage);
+}
+
+// ============================================================================
+// POLL TELEMETRY
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_pollTelemetry(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    if (!isStreaming) {
+
+        return env->NewStringUTF("{}");
+    }
+
+    std::string current_telemetry;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                telemetry_mutex);
+
+        current_telemetry =
+                telemetry_json;
+    }
+
+    return env->NewStringUTF(
+            current_telemetry.c_str());
+}
+
+// ============================================================================
+// SET RGB NATIVE WINDOW
+// ============================================================================
+
+// ============================================================================
+// STAGE 2 VISUALIZATION SNAPSHOT
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_getStage2Visualization(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(
+            stage2_visualization_mutex);
+
+    if (!stage2_visualization_valid) {
+        return env->NewStringUTF("{}");
+    }
+
+    const Stage2Result& data =
+            latest_stage2_result;
+
+    std::ostringstream json;
+
+    json << std::fixed << std::setprecision(4);
+
+    json << "{";
+    json << "\"processingMs\":" << data.processing_ms << ",";
+    json << "\"validPoints\":" << data.valid_points << ",";
+    json << "\"voxelCount\":" << data.voxel_count << ",";
+    json << "\"decimation\":" << stage2_decimation.load() << ",";
+    json << "\"voxelSizeM\":0.0200,";
+
+    // Stage 2.6: RGB projection intrinsics.
+    // The Stage 2 depth is aligned to the RGB stream, so the
+    // aligned-depth coordinates use the RGB camera geometry.
+    json << "\"rgbWidth\":" << color_intrinsics.width << ",";
+    json << "\"rgbHeight\":" << color_intrinsics.height << ",";
+    json << "\"rgbFx\":" << color_intrinsics.fx << ",";
+    json << "\"rgbFy\":" << color_intrinsics.fy << ",";
+    json << "\"rgbCx\":" << color_intrinsics.ppx << ",";
+    json << "\"rgbCy\":" << color_intrinsics.ppy << ",";
+
+    // Stage 2.6 frame association metadata.
+    json << "\"rgbFrameNumber\":" << data.rgb_frame_number << ",";
+    json << "\"rgbTimestampMs\":" << data.rgb_timestamp_ms << ",";
+    json << "\"depthFrameNumber\":" << data.depth_frame_number << ",";
+    json << "\"depthTimestampMs\":" << data.depth_timestamp_ms << ",";
+
+    json << "\"points\":[";
+    for (size_t i = 0;
+         i < data.visualization_points.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const Stage2Point& point =
+                data.visualization_points[i];
+
+        json << "["
+             << point.x << ","
+             << point.y << ","
+             << point.z
+             << "]";
+    }
+    json << "],";
+
+    json << "\"voxels\":[";
+    for (size_t i = 0;
+         i < data.visualization_voxels.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const Stage2Voxel& voxel =
+                data.visualization_voxels[i];
+
+        json << "["
+             << voxel.vx << ","
+             << voxel.vy << ","
+             << voxel.vz
+             << "]";
+    }
+    json << "]";
+
+    json << "}";
+
+    return env->NewStringUTF(
+            json.str().c_str());
+}
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setNativeWindow(
+        JNIEnv* env,
+        jobject /* this */,
+        jobject surface) {
+
+    if (nativeWindow) {
+
+        ANativeWindow_release(
+                nativeWindow);
+
+        nativeWindow = nullptr;
+    }
+
+    if (surface) {
+
+        nativeWindow =
+                ANativeWindow_fromSurface(
+                        env,
+                        surface);
+
+        LOGI(
+                "ANativeWindow set successfully!");
+    }
+}
+
+// ============================================================================
+// RELEASE RGB NATIVE WINDOW
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_releaseNativeWindow(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    if (nativeWindow) {
+
+        ANativeWindow_release(
+                nativeWindow);
+
+        nativeWindow = nullptr;
+    }
+}
+
+// ============================================================================
+// SET DEPTH NATIVE WINDOW
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setDepthNativeWindow(
+        JNIEnv* env,
+        jobject /* this */,
+        jobject surface) {
+
+    if (depthNativeWindow) {
+
+        ANativeWindow_release(
+                depthNativeWindow);
+
+        depthNativeWindow = nullptr;
+    }
+
+    if (surface) {
+
+        depthNativeWindow =
+                ANativeWindow_fromSurface(
+                        env,
+                        surface);
+
+        LOGI(
+                "Depth ANativeWindow set successfully!");
+    }
+}
+
+// ============================================================================
+// RELEASE DEPTH NATIVE WINDOW
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_releaseDepthNativeWindow(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    if (depthNativeWindow) {
+
+        ANativeWindow_release(
+                depthNativeWindow);
+
+        depthNativeWindow = nullptr;
+    }
+}
+
+// ============================================================================
+// CAPTURE CURRENT DEPTH FRAME
+// ============================================================================
+
+extern "C" JNIEXPORT jbyteArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_captureCurrentDepthFrame(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::vector<uint16_t> frame_copy;
+
+    int width = 0;
+    int height = 0;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                latest_depth_mutex);
+
+        if (latest_depth_frame.empty()) {
+
+            LOGE(
+                    "captureCurrentDepthFrame: "
+                    "no latest depth frame available");
+
+            return nullptr;
+        }
+
+        frame_copy =
+                latest_depth_frame;
+
+        width =
+                latest_depth_width;
+
+        height =
+                latest_depth_height;
+    }
+
+    const size_t byte_count =
+            frame_copy.size() *
+            sizeof(uint16_t);
+
+    jbyteArray result =
+            env->NewByteArray(
+                    static_cast<jsize>(
+                            byte_count));
+
+    if (!result) {
+
+        LOGE(
+                "captureCurrentDepthFrame: "
+                "failed to allocate byte array");
+
+        return nullptr;
+    }
+
+    env->SetByteArrayRegion(
+            result,
+            0,
+            static_cast<jsize>(
+                    byte_count),
+            reinterpret_cast<const jbyte*>(
+                    frame_copy.data()));
+
+    LOGI(
+            "captureCurrentDepthFrame: "
+            "latest frame %dx%d, %zu bytes",
+            width,
+            height,
+            byte_count);
+
+    return result;
+}

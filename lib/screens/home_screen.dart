@@ -3,6 +3,8 @@ import 'package:flutter/foundation.dart';
 import 'package:provider/provider.dart';
 import 'package:camera/camera.dart';
 import '../providers/app_state.dart';
+import 'stage2_visualization_screen.dart';
+import 'stage4_visualization_screen.dart';
 
 class HomeScreen extends StatefulWidget {
   const HomeScreen({super.key});
@@ -179,7 +181,8 @@ class _HomeScreenState extends State<HomeScreen> {
 
           // 2. Removed static detections mapped in position (replaced by overlay in CustomPaint)
 
-          // 3. Live MediaPipe Output Panel
+          // 3. Live D455 IMU Panel
+          // 4. Live MediaPipe Output Panel
           Positioned(
             left: 16,
             right: 16,
@@ -323,9 +326,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       fontSize: 10,
                     ),
                   ),
-
                   const SizedBox(height: 3),
-
                   Text(
                     'MediaPipe CPU E2E  |  '
                     'p50: ${state.e2eP50Ms.toStringAsFixed(1)} ms  |  '
@@ -342,7 +343,7 @@ class _HomeScreenState extends State<HomeScreen> {
             ),
           ),
 
-          // 4. Floating Control Panel
+          // 5. Floating Control Panel
           Positioned(
             left: 16,
             bottom: 16,
@@ -424,13 +425,10 @@ class _HomeScreenState extends State<HomeScreen> {
                   OutlinedButton.icon(
                     onPressed: state.isCameraConnected &&
                             !state.isFixedRecording
-                        ? () => context
-                            .read<AppState>()
-                            .startFixedRecording()
+                        ? () => context.read<AppState>().startFixedRecording()
                         : state.isFixedRecording
-                            ? () => context
-                                .read<AppState>()
-                                .stopFixedRecording()
+                            ? () =>
+                                context.read<AppState>().stopFixedRecording()
                             : null,
                     icon: Icon(
                       state.isFixedRecording
@@ -439,9 +437,7 @@ class _HomeScreenState extends State<HomeScreen> {
                       size: 18,
                     ),
                     label: Text(
-                      state.isFixedRecording
-                          ? 'RECORDING...'
-                          : 'FIXED TEST',
+                      state.isFixedRecording ? 'RECORDING...' : 'FIXED TEST',
                     ),
                     style: OutlinedButton.styleFrom(
                       foregroundColor: state.isFixedRecording
@@ -466,6 +462,46 @@ class _HomeScreenState extends State<HomeScreen> {
                       side: const BorderSide(color: Colors.lightBlueAccent),
                     ),
                   ),
+
+                  const SizedBox(width: 8),
+
+                  // STAGE 2
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const Stage2VisualizationScreen(),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.view_in_ar, size: 18),
+                    label: const Text('STAGE 2'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.greenAccent,
+                      side: const BorderSide(color: Colors.greenAccent),
+                    ),
+                  ),
+
+                  const SizedBox(width: 8),
+
+                  // STAGE 4
+                  OutlinedButton.icon(
+                    onPressed: () {
+                      Navigator.push(
+                        context,
+                        MaterialPageRoute(
+                          builder: (_) => const Stage4VisualizationScreen(),
+                        ),
+                      );
+                    },
+                    icon: const Icon(Icons.track_changes, size: 18),
+                    label: const Text('STAGE 4'),
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: Colors.purpleAccent,
+                      side: const BorderSide(color: Colors.purpleAccent),
+                    ),
+                  ),
                 ],
               ),
             ),
@@ -474,7 +510,6 @@ class _HomeScreenState extends State<HomeScreen> {
       ),
     );
   }
-
 
   void _showDiagnostics(BuildContext context) {
     showModalBottomSheet(
@@ -493,7 +528,6 @@ class _HomeScreenState extends State<HomeScreen> {
     return Colors.grey;
   }
 }
-
 
 class _SustainedDiagnosticsSheet extends StatelessWidget {
   const _SustainedDiagnosticsSheet();
@@ -604,8 +638,7 @@ class _SustainedDiagnosticsSheet extends StatelessWidget {
                             style: ElevatedButton.styleFrom(
                               backgroundColor: Colors.greenAccent,
                               foregroundColor: Colors.black,
-                              padding:
-                                  const EdgeInsets.symmetric(vertical: 13),
+                              padding: const EdgeInsets.symmetric(vertical: 13),
                             ),
                           ),
                         ),
@@ -613,17 +646,15 @@ class _SustainedDiagnosticsSheet extends StatelessWidget {
                         Expanded(
                           child: OutlinedButton.icon(
                             onPressed: state.isSustainedTestRunning
-                                ? () => context
-                                    .read<AppState>()
-                                    .stopSustainedTest()
+                                ? () =>
+                                    context.read<AppState>().stopSustainedTest()
                                 : null,
                             icon: const Icon(Icons.stop),
                             label: const Text('STOP TEST'),
                             style: OutlinedButton.styleFrom(
                               foregroundColor: Colors.redAccent,
                               side: const BorderSide(color: Colors.redAccent),
-                              padding:
-                                  const EdgeInsets.symmetric(vertical: 13),
+                              padding: const EdgeInsets.symmetric(vertical: 13),
                             ),
                           ),
                         ),
@@ -642,13 +673,14 @@ class _SustainedDiagnosticsSheet extends StatelessWidget {
                       child: Column(
                         crossAxisAlignment: CrossAxisAlignment.start,
                         children: [
-                          _valueRow('Current',
-                              _fmt(state.telemetry.fps)),
-                          _valueRow('Average',
+                          _valueRow('Current', _fmt(state.telemetry.fps)),
+                          _valueRow(
+                              'Average',
                               state.sustainedFpsSamples == 0
                                   ? '--'
                                   : _fmt(state.sustainedAverageFps)),
-                          _valueRow('Minimum',
+                          _valueRow(
+                              'Minimum',
                               state.sustainedFpsSamples == 0
                                   ? '--'
                                   : _fmt(state.sustainedMinFps)),
@@ -706,19 +738,22 @@ class _SustainedDiagnosticsSheet extends StatelessWidget {
                         children: [
                           _valueRow('Battery',
                               '${_fmt(state.sustainedBatteryCurrent)}%'),
-                          _valueRow('Drain',
-                              '${_fmt(state.sustainedBatteryDrain)}%'),
-                          _valueRow('Temperature',
+                          _valueRow(
+                              'Drain', '${_fmt(state.sustainedBatteryDrain)}%'),
+                          _valueRow(
+                              'Temperature',
                               state.isSustainedTestRunning
                                   ? '${_fmt(state.sustainedCurrentTemperature)} °C'
                                   : '--'),
-                          _valueRow('Battery temp',
+                          _valueRow(
+                              'Battery temp',
                               state.telemetry.batteryTemperature > 0
                                   ? '${_fmt(state.telemetry.batteryTemperature)} °C'
                                   : '--'),
                           _valueRow('Max temp',
                               '${_fmt(state.sustainedMaxTemperature)} °C'),
-                          _valueRow('CPU clock',
+                          _valueRow(
+                              'CPU clock',
                               state.cpuClockMhz == null
                                   ? '--'
                                   : '${_fmt(state.cpuClockMhz!)} MHz'),
@@ -737,10 +772,10 @@ class _SustainedDiagnosticsSheet extends StatelessWidget {
                           _valueRow('Status', state.sustainedStatus),
                           _valueRow('Elapsed', state.sustainedElapsedText),
                           _valueRow('Remaining', state.sustainedRemainingText),
-                          _valueRow('Samples',
-                              state.sustainedSamples.toString()),
-                          _valueRow('E2E samples',
-                              state.e2eSampleCount.toString()),
+                          _valueRow(
+                              'Samples', state.sustainedSamples.toString()),
+                          _valueRow(
+                              'E2E samples', state.e2eSampleCount.toString()),
                         ],
                       ),
                     ),

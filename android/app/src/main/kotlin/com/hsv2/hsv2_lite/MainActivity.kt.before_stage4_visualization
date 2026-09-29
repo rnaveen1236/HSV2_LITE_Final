@@ -1,0 +1,1797 @@
+package com.hsv2.hsv2_lite
+
+import android.app.PendingIntent
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.hardware.usb.UsbDevice
+import android.hardware.usb.UsbManager
+import android.os.Build
+import android.os.BatteryManager
+import android.os.Handler
+import android.os.Looper
+import android.util.Log
+import android.graphics.Bitmap
+import androidx.annotation.NonNull
+import androidx.annotation.Keep
+import io.flutter.embedding.android.FlutterActivity
+import io.flutter.embedding.engine.FlutterEngine
+import io.flutter.plugin.common.EventChannel
+import io.flutter.plugin.common.MethodChannel
+import java.nio.ByteBuffer
+import java.nio.ByteOrder
+
+import com.hsv2.hsv2_lite.mediapipe.BoundingBox
+import com.hsv2.hsv2_lite.mediapipe.DepthProcessor
+import com.hsv2.hsv2_lite.mediapipe.DirectionCalculator
+import com.hsv2.hsv2_lite.mediapipe.DetectionResult
+import com.hsv2.hsv2_lite.mediapipe.toFlutterMap
+
+class MainActivity : FlutterActivity() {
+
+    // =========================================================================
+    // ANDROID BATTERY TELEMETRY
+    // =========================================================================
+
+    private fun getBatteryLevelPercent(): Float {
+        return try {
+            val batteryManager =
+                getSystemService(Context.BATTERY_SERVICE) as BatteryManager
+
+            val level =
+                batteryManager.getIntProperty(
+                    BatteryManager.BATTERY_PROPERTY_CAPACITY
+                )
+
+            if (level in 0..100) {
+                level.toFloat()
+            } else {
+                -1.0f
+            }
+
+        } catch (e: Exception) {
+            Log.e(
+                LOG_TAG,
+                "Failed to read Android battery level",
+                e
+            )
+            -1.0f
+        }
+    }
+
+
+    private fun getBatteryTemperatureCelsius(): Float {
+        return try {
+            val intent = registerReceiver(
+                null,
+                android.content.IntentFilter(android.content.Intent.ACTION_BATTERY_CHANGED)
+            )
+
+            val rawTemperature =
+                intent?.getIntExtra(android.os.BatteryManager.EXTRA_TEMPERATURE, -1)
+                    ?: -1
+
+            if (rawTemperature >= 0) {
+                rawTemperature / 10.0f
+            } else {
+                -1.0f
+            }
+        } catch (e: Exception) {
+            Log.e(
+                LOG_TAG,
+                "Failed to read battery temperature",
+                e
+            )
+            -1.0f
+        }
+    }
+
+    // =========================================================================
+    // PERSISTENT MEDIAPIPE DETECTOR
+    // =========================================================================
+
+    private var liveMediaPipeDetector:
+        com.hsv2.hsv2_lite.mediapipe.MediaPipeDetector? = null
+
+    // =========================================================================
+    // DEPTH PROCESSOR
+    // =========================================================================
+
+    private val depthProcessor =
+        DepthProcessor()
+
+    // =========================================================================
+    // DIRECTION CALCULATOR
+    // =========================================================================
+
+    private val directionCalculator =
+        DirectionCalculator()
+
+    // D455 color stream calibration.
+    // Resolution: 640 x 480
+    // fx from the native RealSense calibration: 387.98 px
+    // cx uses the 640-pixel image center for this spike.
+    private companion object {
+        const val COLOR_PRINCIPAL_X = 320.0f
+        const val COLOR_FOCAL_LENGTH_X = 387.98f
+    }
+
+    // =========================================================================
+    // CHANNELS
+    // =========================================================================
+
+    private val COMMAND_CHANNEL = "com.hsv2/command"
+    private val TELEMETRY_CHANNEL = "com.hsv2/telemetry"
+    private val USB_STATUS_CHANNEL = "com.hsv2/usb_status"
+    private val ACTION_USB_PERMISSION =
+        "com.hsv2.hsv2_lite.USB_PERMISSION"
+
+    private val LOG_TAG = "HSV2Lite"
+
+    // =========================================================================
+    // SURFACE TEXTURES
+    // =========================================================================
+
+    private var rgbTextureEntry:
+        io.flutter.view.TextureRegistry.SurfaceTextureEntry? = null
+
+    private var rgbSurface:
+        android.view.Surface? = null
+
+    private var depthTextureEntry:
+        io.flutter.view.TextureRegistry.SurfaceTextureEntry? = null
+
+    private var depthSurface:
+        android.view.Surface? = null
+
+    // =========================================================================
+    // EVENT CHANNEL
+    // =========================================================================
+
+    private var eventSink:
+        EventChannel.EventSink? = null
+
+    private var usbStatusSink:
+        EventChannel.EventSink? = null
+
+    private val handler =
+        Handler(Looper.getMainLooper())
+
+    private var isPolling = false
+
+    private lateinit var usbManager: UsbManager
+
+    // =========================================================================
+    // NATIVE LIBRARY
+    // =========================================================================
+
+    init {
+        try {
+
+            System.loadLibrary("hsv2_lite")
+
+        } catch (e: UnsatisfiedLinkError) {
+
+            Log.e(
+                "HSV2Lite",
+                "Failed to load hsv2_lite native library: ${e.message}"
+            )
+        }
+    }
+
+    // =========================================================================
+    // NATIVE REALSENSE FUNCTIONS
+    // =========================================================================
+
+    @Keep
+    external fun startPipeline()
+
+    @Keep
+    external fun stopPipeline()
+
+    @Keep
+    external fun startFixedRecording(filesDir: String)
+
+    @Keep
+    external fun stopFixedRecording()
+
+    @Keep
+    external fun exportFixedRecording(destinationDir: String): Boolean
+
+    @Keep
+    external fun captureCurrentRgbFrame(): ByteArray?
+
+    // RGB bounding box -> Depth bounding box
+    @Keep
+    external fun mapColorBoxToDepthBox(
+        left: Float,
+        top: Float,
+        right: Float,
+        bottom: Float
+    ): FloatArray?
+
+    @Keep
+    external fun captureCurrentDepthFrame(): ByteArray?
+
+    // P3.2.3: Depth pixel -> D455 camera-frame XYZ (meters)
+    @Keep
+    external fun deprojectDepthPixelToXYZ(
+        depthX: Float,
+        depthY: Float,
+        depthMeters: Float
+    ): FloatArray?
+
+    // P3.2.5: Object XYZ -> ground-plane cross-check
+    @Keep
+    external fun checkP325ObjectAgainstGroundPlane(
+        xMeters: Float,
+        yMeters: Float,
+        zMeters: Float
+    ): FloatArray?
+
+    @Keep
+    external fun setStage(stage: Int)
+
+    @Keep
+    external fun setStage2Decimation(decimation: Int)
+
+    @Keep
+    external fun pollTelemetry(): String
+
+    // Stage 2 dedicated visualization snapshot
+    @Keep
+    external fun getStage2Visualization(): String
+
+    // Stage 4 dedicated visualization snapshot
+    @Keep
+    external fun getStage4Visualization(): String
+
+    private external fun initRealSenseWithFD(
+        fd: Int,
+        usbfsPath: String
+    ): Boolean
+
+    @Keep
+    external fun setNativeWindow(
+        surface: android.view.Surface
+    )
+
+    @Keep
+    external fun releaseNativeWindow()
+
+    @Keep
+    external fun setDepthNativeWindow(
+        surface: android.view.Surface
+    )
+
+    @Keep
+    external fun releaseDepthNativeWindow()
+
+    // =========================================================================
+    // USB RECEIVER
+    // =========================================================================
+
+    private val usbReceiver =
+        object : BroadcastReceiver() {
+
+            override fun onReceive(
+                context: Context,
+                intent: Intent
+            ) {
+
+                val action = intent.action
+
+                if (ACTION_USB_PERMISSION == action) {
+
+                    synchronized(this) {
+
+                        val device: UsbDevice? =
+                            intent.getParcelableExtra(
+                                UsbManager.EXTRA_DEVICE
+                            )
+
+                        if (
+                            intent.getBooleanExtra(
+                                UsbManager.EXTRA_PERMISSION_GRANTED,
+                                false
+                            )
+                        ) {
+
+                            device?.apply {
+
+                                Log.i(
+                                    LOG_TAG,
+                                    "USB Permission granted for device: ${device.deviceName}"
+                                )
+
+                                connectToDevice(this)
+                            }
+
+                        } else {
+
+                            Log.e(
+                                LOG_TAG,
+                                "USB Permission denied for device $device"
+                            )
+
+                            notifyUsbStatus(
+                                "PERMISSION DENIED"
+                            )
+                        }
+                    }
+
+                } else if (
+                    UsbManager.ACTION_USB_DEVICE_ATTACHED == action
+                ) {
+
+                    Log.i(
+                        LOG_TAG,
+                        "USB Device Attached"
+                    )
+
+                    checkUsbDevices()
+
+                } else if (
+                    UsbManager.ACTION_USB_DEVICE_DETACHED == action
+                ) {
+
+                    Log.i(
+                        LOG_TAG,
+                        "USB Device Detached"
+                    )
+
+                    notifyUsbStatus(
+                        "DISCONNECTED"
+                    )
+                }
+            }
+        }
+
+    // =========================================================================
+    // FLUTTER ENGINE
+    // =========================================================================
+
+    override fun configureFlutterEngine(
+        @NonNull flutterEngine: FlutterEngine
+    ) {
+
+        super.configureFlutterEngine(
+            flutterEngine
+        )
+
+        usbManager =
+            getSystemService(
+                Context.USB_SERVICE
+            ) as UsbManager
+
+        // ---------------------------------------------------------------------
+        // USB RECEIVER
+        // ---------------------------------------------------------------------
+
+        val filter =
+            IntentFilter(
+                ACTION_USB_PERMISSION
+            )
+
+        filter.addAction(
+            UsbManager.ACTION_USB_DEVICE_ATTACHED
+        )
+
+        filter.addAction(
+            UsbManager.ACTION_USB_DEVICE_DETACHED
+        )
+
+        if (Build.VERSION.SDK_INT >= 33) {
+
+            registerReceiver(
+                usbReceiver,
+                filter,
+                Context.RECEIVER_EXPORTED
+            )
+
+        } else {
+
+            registerReceiver(
+                usbReceiver,
+                filter
+            )
+        }
+
+        // =========================================================================
+        // COMMAND CHANNEL
+        // =========================================================================
+
+        MethodChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            COMMAND_CHANNEL
+        ).setMethodCallHandler { call, result ->
+
+            when (call.method) {
+
+                // -----------------------------------------------------------------
+                // START PIPELINE
+                // -----------------------------------------------------------------
+
+                "startPipeline" -> {
+
+                    try {
+
+                        startPipeline()
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Native call failed",
+                            e
+                        )
+                    }
+
+                    result.success(null)
+                }
+
+                // -----------------------------------------------------------------
+                // STOP PIPELINE
+                // -----------------------------------------------------------------
+
+                "stopPipeline" -> {
+
+                    try {
+
+                        stopPipeline()
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Native call failed",
+                            e
+                        )
+                    }
+
+                    result.success(null)
+                }
+
+                // -----------------------------------------------------------------
+                // START FIXED TEST RECORDING
+                // -----------------------------------------------------------------
+
+                "startFixedRecording" -> {
+
+                    try {
+
+                        // Start D455 RGB + Depth + IMU pipeline first
+                        startPipeline()
+
+                        // Give the native stream thread time to initialize
+                        Thread.sleep(500)
+
+                        // Start fixed-sequence recording
+                        startFixedRecording(
+                            filesDir.absolutePath
+                        )
+
+                        Log.i(
+                            LOG_TAG,
+                            "Fixed test recording started"
+                        )
+
+                        result.success(null)
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Fixed recording start failed",
+                            e
+                        )
+
+                        result.error(
+                            "FIXED_RECORDING_START_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // STOP FIXED TEST RECORDING
+                // -----------------------------------------------------------------
+
+                "stopFixedRecording" -> {
+
+                    try {
+
+                        stopFixedRecording()
+
+                        Log.i(
+                            LOG_TAG,
+                            "Fixed test recording stopped"
+                        )
+
+                        result.success(null)
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Fixed recording stop failed",
+                            e
+                        )
+
+                        result.error(
+                            "FIXED_RECORDING_STOP_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // EXPORT FIXED TEST RECORDING
+                // -----------------------------------------------------------------
+
+                "exportFixedRecording" -> {
+
+                    try {
+
+                        val externalDir =
+                            getExternalFilesDir(null)
+
+                        if (externalDir == null) {
+
+                            result.error(
+                                "EXPORT_NO_DIRECTORY",
+                                "External files directory unavailable",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        val success =
+                            exportFixedRecording(
+                                externalDir.absolutePath
+                            )
+
+                        if (success) {
+
+                            Log.i(
+                                LOG_TAG,
+                                "Fixed recording exported successfully"
+                            )
+
+                            result.success(true)
+
+                        } else {
+
+                            result.error(
+                                "EXPORT_FAILED",
+                                "Native fixed recording export failed",
+                                null
+                            )
+                        }
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Fixed recording export failed",
+                            e
+                        )
+
+                        result.error(
+                            "EXPORT_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // RUN FIXED-SEQUENCE REPLAY BENCHMARK
+                // -----------------------------------------------------------------
+
+                "runReplayBenchmark" -> {
+
+                    Thread {
+                        try {
+
+                            Log.i(
+                                LOG_TAG,
+                                "Starting fixed-sequence replay benchmark"
+                            )
+
+                            val replay =
+                                com.hsv2.hsv2_lite.mediapipe.ReplayBenchmark(
+                                    this
+                                )
+
+                            val benchmarkResult =
+                                replay.run()
+
+                            Log.i(
+                                LOG_TAG,
+                                "REPLAY RESULT: " +
+                                    "frames=${benchmarkResult.frames}, " +
+                                    "elapsed=${"%.3f".format(benchmarkResult.durationSeconds)}s, " +
+                                    "fps=${"%.2f".format(benchmarkResult.replayFps)}, " +
+                                    "p50=${"%.2f".format(benchmarkResult.p50Ms)}ms, " +
+                                    "p95=${"%.2f".format(benchmarkResult.p95Ms)}ms, " +
+                                    "p99=${"%.2f".format(benchmarkResult.p99Ms)}ms, " +
+                                    "detections=${benchmarkResult.detections}"
+                            )
+
+                            runOnUiThread {
+                                result.success(
+                                    mapOf(
+                                        "frames" to benchmarkResult.frames,
+                                        "durationSeconds" to benchmarkResult.durationSeconds,
+                                        "replayFps" to benchmarkResult.replayFps,
+                                        "p50Ms" to benchmarkResult.p50Ms,
+                                        "p95Ms" to benchmarkResult.p95Ms,
+                                        "p99Ms" to benchmarkResult.p99Ms,
+                                        "detections" to benchmarkResult.detections
+                                    )
+                                )
+                            }
+
+                        } catch (e: Exception) {
+
+                            Log.e(
+                                LOG_TAG,
+                                "Replay benchmark failed",
+                                e
+                            )
+
+                            runOnUiThread {
+                                result.error(
+                                    "REPLAY_BENCHMARK_ERROR",
+                                    e.message,
+                                    null
+                                )
+                            }
+                        }
+                    }.start()
+                }
+
+                // -----------------------------------------------------------------
+                // SET STAGE 2 DECIMATION
+                // -----------------------------------------------------------------
+
+                "setStage2Decimation" -> {
+
+                    val decimation =
+                        call.argument<Int>("decimation")
+                            ?: 2
+
+                    try {
+
+                        setStage2Decimation(decimation)
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Stage 2 decimation update failed",
+                            e
+                        )
+                    }
+
+                    result.success(null)
+                }
+
+                // -----------------------------------------------------------------
+                // SET STAGE
+                // -----------------------------------------------------------------
+
+                "setStage" -> {
+
+                    val stage =
+                        call.argument<Int>("stage")
+                            ?: 1
+
+                    try {
+
+                        setStage(stage)
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Native call failed",
+                            e
+                        )
+                    }
+
+                    result.success(null)
+                }
+
+                // -----------------------------------------------------------------
+                // STAGE 2 VISUALIZATION
+                // -----------------------------------------------------------------
+
+                "getStage2Visualization" -> {
+
+                    try {
+
+                        result.success(
+                            getStage2Visualization()
+                        )
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "Stage 2 visualization failed",
+                            e
+                        )
+
+                        result.error(
+                            "STAGE2_VISUALIZATION_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                // -----------------------------------------------------------------
+                // CREATE RGB TEXTURE
+                // -----------------------------------------------------------------
+
+                "createTexture" -> {
+
+                    rgbTextureEntry =
+                        flutterEngine.renderer
+                            .createSurfaceTexture()
+
+                    val surfaceTexture =
+                        rgbTextureEntry!!
+                            .surfaceTexture()
+
+                    surfaceTexture.setDefaultBufferSize(
+                        640,
+                        480
+                    )
+
+                    rgbSurface =
+                        android.view.Surface(
+                            surfaceTexture
+                        )
+
+                    setNativeWindow(
+                        rgbSurface!!
+                    )
+
+                    result.success(
+                        rgbTextureEntry!!.id()
+                    )
+                }
+
+                // -----------------------------------------------------------------
+                // CREATE DEPTH TEXTURE
+                // -----------------------------------------------------------------
+
+                "createDepthTexture" -> {
+
+                    depthTextureEntry =
+                        flutterEngine.renderer
+                            .createSurfaceTexture()
+
+                    val surfaceTexture =
+                        depthTextureEntry!!
+                            .surfaceTexture()
+
+                    surfaceTexture.setDefaultBufferSize(
+                        640,
+                        480
+                    )
+
+                    depthSurface =
+                        android.view.Surface(
+                            surfaceTexture
+                        )
+
+                    setDepthNativeWindow(
+                        depthSurface!!
+                    )
+
+                    result.success(
+                        depthTextureEntry!!.id()
+                    )
+                }
+
+                // -----------------------------------------------------------------
+                // CHECK USB
+                // -----------------------------------------------------------------
+
+                "checkUsb" -> {
+
+                    checkUsbDevices()
+
+                    result.success(null)
+                }
+
+                // =========================================================================
+                // LIVE MEDIAPIPE
+                // =========================================================================
+
+                "testLiveMediaPipe" -> {
+
+                    try {
+
+                        // -------------------------------------------------------------
+                        // Capture latest RGB + Depth frames
+                        // -------------------------------------------------------------
+
+                        val frameBytes =
+                            captureCurrentRgbFrame()
+
+                        val depthBytes =
+                            captureCurrentDepthFrame()
+
+                        Log.d(
+                            "MediaPipeLiveTest",
+                            "RGB bytes=${frameBytes?.size ?: 0}, " +
+                                "Depth bytes=${depthBytes?.size ?: 0}"
+                        )
+
+                        if (frameBytes == null) {
+
+                            result.error(
+                                "NO_FRAME",
+                                "No latest RGB frame available",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        if (depthBytes == null) {
+
+                            result.error(
+                                "NO_DEPTH_FRAME",
+                                "No latest depth frame available",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        // -------------------------------------------------------------
+                        // D455 stream resolution
+                        // -------------------------------------------------------------
+
+                        val width = 640
+                        val height = 480
+
+                        val expectedRgbBytes =
+                            width * height * 4
+
+                        val expectedDepthBytes =
+                            width * height * 2
+
+                        if (
+                            frameBytes.size !=
+                                expectedRgbBytes
+                        ) {
+
+                            result.error(
+                                "FRAME_SIZE_ERROR",
+                                "Unexpected RGB frame size: ${frameBytes.size}",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        if (
+                            depthBytes.size !=
+                                expectedDepthBytes
+                        ) {
+
+                            result.error(
+                                "DEPTH_SIZE_ERROR",
+                                "Unexpected depth frame size: ${depthBytes.size}",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        // -------------------------------------------------------------
+                        // RGB ByteArray -> Bitmap
+                        // -------------------------------------------------------------
+
+                        val bitmap =
+                            Bitmap.createBitmap(
+                                width,
+                                height,
+                                Bitmap.Config.ARGB_8888
+                            )
+
+                        bitmap.copyPixelsFromBuffer(
+                            ByteBuffer
+                                .wrap(frameBytes)
+                                .order(ByteOrder.LITTLE_ENDIAN)
+                        )
+
+                        // -------------------------------------------------------------
+                        // Initialize persistent MediaPipe detector
+                        // -------------------------------------------------------------
+
+                        if (
+                            liveMediaPipeDetector == null
+                        ) {
+
+                            liveMediaPipeDetector =
+                                com.hsv2.hsv2_lite.mediapipe.MediaPipeDetector(
+                                    this
+                                )
+
+                            liveMediaPipeDetector
+                                ?.initialize()
+
+                            Log.d(
+                                "MediaPipeLiveTest",
+                                "Persistent MediaPipe detector initialized"
+                            )
+                        }
+
+                        val detector =
+                            liveMediaPipeDetector
+                                ?: throw IllegalStateException(
+                                    "MediaPipe detector initialization failed"
+                                )
+
+                        // -------------------------------------------------------------
+                        // MediaPipe detection timing
+                        // -------------------------------------------------------------
+
+                        val detectStartNs =
+                            System.nanoTime()
+
+                        val detections =
+                            detector.detect(
+                                bitmap,
+                                System.currentTimeMillis()
+                            )
+
+                        val detectLatencyMs =
+                            (
+                                System.nanoTime() -
+                                    detectStartNs
+                            ) / 1_000_000.0
+
+                        Log.d(
+                            "MediaPipeLiveTest",
+                            "MediaPipe CPU detection latency=" +
+                                String.format(
+                                    "%.2f ms",
+                                    detectLatencyMs
+                                )
+                        )
+
+                        // -------------------------------------------------------------
+                        // DEPTH BYTE ARRAY -> SHORT ARRAY
+                        //
+                        // D455 Z16 depth:
+                        // 640 x 480 x 2 bytes
+                        // -------------------------------------------------------------
+
+                        val depthData =
+                            ShortArray(
+                                width * height
+                            )
+
+                        ByteBuffer
+                            .wrap(depthBytes)
+                            .order(ByteOrder.LITTLE_ENDIAN)
+                            .asShortBuffer()
+                            .get(depthData)
+
+                        // -------------------------------------------------------------
+                        // Process each MediaPipe detection
+                        // -------------------------------------------------------------
+
+                        val output =
+                            detections.map { detection ->
+
+                                val rgbBox =
+                                    BoundingBox(
+                                        left =
+                                            detection.left,
+                                        top =
+                                            detection.top,
+                                        right =
+                                            detection.right,
+                                        bottom =
+                                            detection.bottom
+                                    )
+
+                                // -----------------------------------------------------
+                                // RGB -> DEPTH BOX
+                                // -----------------------------------------------------
+
+                                val mappedDepthBox =
+                                    mapColorBoxToDepthBox(
+                                        detection.left,
+                                        detection.top,
+                                        detection.right,
+                                        detection.bottom
+                                    )
+
+                                var distanceMeters:
+                                    Float? = null
+
+                                // P3.2.3: Object XYZ in D455 depth-camera frame
+                                var xMeters:
+                                    Float? = null
+
+                                var yMeters:
+                                    Float? = null
+
+                                var zMeters:
+                                    Float? = null
+
+                                // P3.2.5: Object-to-ground-plane cross-check
+                                var groundPlaneDistanceMeters:
+                                    Float? = null
+
+                                var groundPlaneValid =
+                                    false
+
+                                var groundPlaneUsingFallback =
+                                    false
+
+                                var depthBoxOutput:
+                                    Map<String, Float>? =
+                                    null
+
+                                // -----------------------------------------------------
+                                // DIRECTION
+                                // -----------------------------------------------------
+
+                                val angleDegrees =
+                                    directionCalculator.calculateAngleDegrees(
+                                        centerX = detection.centerX,
+                                        principalX = COLOR_PRINCIPAL_X,
+                                        focalLengthX = COLOR_FOCAL_LENGTH_X
+                                    )
+
+                                val clockDirection =
+                                    directionCalculator.angleToClockDirection(
+                                        angleDegrees
+                                    )
+
+                                val horizontalDirection =
+                                    directionCalculator.angleToHorizontalDirection(
+                                        angleDegrees
+                                    )
+
+                                // -----------------------------------------------------
+                                // MEDIAN DEPTH
+                                // -----------------------------------------------------
+
+                                if (
+                                    mappedDepthBox != null &&
+                                    mappedDepthBox.size >= 4
+                                ) {
+
+                                    val depthBox =
+                                        BoundingBox(
+                                            left =
+                                                mappedDepthBox[0],
+                                            top =
+                                                mappedDepthBox[1],
+                                            right =
+                                                mappedDepthBox[2],
+                                            bottom =
+                                                mappedDepthBox[3]
+                                        )
+
+                                    val medianDepthMm =
+                                        depthProcessor
+                                            .calculateMedianDepthMm(
+                                                depthData =
+                                                    depthData,
+                                                depthWidth =
+                                                    width,
+                                                depthHeight =
+                                                    height,
+                                                box =
+                                                    depthBox
+                                            )
+
+                                    if (
+                                        medianDepthMm != null
+                                    ) {
+
+                                        distanceMeters =
+                                            depthProcessor
+                                                .depthMmToMeters(
+                                                    medianDepthMm
+                                                )
+
+                                        // -------------------------------------------------
+                                        // P3.2.3: DEPTH BOX CENTER -> 3D XYZ
+                                        // -------------------------------------------------
+
+                                        val centerDepthX =
+                                            (depthBox.left +
+                                                depthBox.right) * 0.5f
+
+                                        val centerDepthY =
+                                            (depthBox.top +
+                                                depthBox.bottom) * 0.5f
+
+                                        val xyz =
+                                            deprojectDepthPixelToXYZ(
+                                                centerDepthX,
+                                                centerDepthY,
+                                                distanceMeters
+                                            )
+
+                                        if (xyz != null &&
+                                            xyz.size >= 3) {
+
+                                            xMeters = xyz[0]
+                                            yMeters = xyz[1]
+                                            zMeters = xyz[2]
+
+                                            Log.d(
+                                                "MediaPipeLiveTest",
+                                                "P3.2.3 XYZ: " +
+                                                    "${detection.className} " +
+                                                    "XYZ=[" +
+                                                    "${xMeters}, " +
+                                                    "${yMeters}, " +
+                                                    "${zMeters}] m"
+                                            )
+
+                                            // -------------------------------------------------
+                                            // P3.2.5: XYZ -> GROUND-PLANE CROSS-CHECK
+                                            // -------------------------------------------------
+
+                                            val groundPlane =
+                                                checkP325ObjectAgainstGroundPlane(
+                                                    xMeters,
+                                                    yMeters,
+                                                    zMeters
+                                                )
+
+                                            if (groundPlane != null &&
+                                                groundPlane.size >= 3) {
+
+                                                groundPlaneDistanceMeters =
+                                                    groundPlane[0]
+
+                                                groundPlaneValid =
+                                                    groundPlane[1] > 0.5f
+
+                                                groundPlaneUsingFallback =
+                                                    groundPlane[2] > 0.5f
+
+                                                Log.d(
+                                                    "MediaPipeLiveTest",
+                                                    "P3.2.5 GroundCrossCheck: " +
+                                                        "${detection.className} " +
+                                                        "planeDistance=" +
+                                                        "${groundPlaneDistanceMeters} m " +
+                                                        "valid=" +
+                                                        "${groundPlaneValid} " +
+                                                        "fallback=" +
+                                                        "${groundPlaneUsingFallback}"
+                                                )
+                                            } else {
+
+                                                Log.w(
+                                                    "MediaPipeLiveTest",
+                                                    "P3.2.5 GroundCrossCheck failed for " +
+                                                        detection.className
+                                                )
+                                            }
+                                        } else {
+
+                                            Log.w(
+                                                "MediaPipeLiveTest",
+                                                "P3.2.3 XYZ failed for " +
+                                                    detection.className
+                                            )
+                                        }
+
+                                        Log.d(
+                                            "MediaPipeLiveTest",
+                                            "Depth: " +
+                                                "${detection.className} = " +
+                                                "${distanceMeters} m"
+                                        )
+                                    }
+
+                                    depthBoxOutput =
+                                        mapOf(
+                                            "left" to
+                                                depthBox.left,
+                                            "top" to
+                                                depthBox.top,
+                                            "right" to
+                                                depthBox.right,
+                                            "bottom" to
+                                                depthBox.bottom
+                                        )
+
+                                } else {
+
+                                    Log.w(
+                                        "MediaPipeLiveTest",
+                                        "RGB->Depth mapping failed for " +
+                                            detection.className
+                                    )
+                                }
+
+                                // -----------------------------------------------------
+                                // OUTPUT
+                                //
+                                // Detector interface remains:
+                                // {class, score, box}
+                                //
+                                // Downstream adds:
+                                // distanceMeters
+                                // depthBox
+                                // -----------------------------------------------------
+                                DetectionResult(
+                                    className = detection.className,
+                                    score = detection.score,
+                                    box = rgbBox,
+                                    distanceMeters = distanceMeters,
+                                    xMeters = xMeters,
+                                    yMeters = yMeters,
+                                    zMeters = zMeters,
+                                    direction = clockDirection,
+                                    horizontalDirection = horizontalDirection,
+                                    angleDegrees = angleDegrees,
+                                    groundPlaneDistanceMeters =
+                                        groundPlaneDistanceMeters,
+                                    groundPlaneValid =
+                                        groundPlaneValid,
+                                    groundPlaneUsingFallback =
+                                        groundPlaneUsingFallback,
+                                    depthBox = mappedDepthBox?.let {
+                                        BoundingBox(
+                                            left = it[0],
+                                            top = it[1],
+                                            right = it[2],
+                                            bottom = it[3]
+                                        )
+                                    }
+                                )
+                            }
+
+                        // -------------------------------------------------------------
+                        // Logging
+                        // -------------------------------------------------------------
+
+                        Log.d(
+                            "MediaPipeLiveTest",
+                            "Live detections=${output.size}"
+                        )
+                        for (
+                            detection in output
+                        ) {
+
+                            Log.d(
+                                "MediaPipeLiveTest",
+                                "RESULT: " +
+                                    "class=${detection.className}, " +
+                                    "score=${detection.score}, " +
+                                    "distance=${detection.distanceMeters}, " +
+                                    "direction=${detection.direction}, " +
+                                    "horizontal=${detection.horizontalDirection}, " +
+                                    "angle=${detection.angleDegrees}, " +
+                                    "XYZ=[" +
+                                    "${detection.xMeters}, " +
+                                    "${detection.yMeters}, " +
+                                    "${detection.zMeters}], " +
+                                    "planeDistance=${detection.groundPlaneDistanceMeters}, " +
+                                    "planeValid=${detection.groundPlaneValid}, " +
+                                    "planeFallback=${detection.groundPlaneUsingFallback}, " +
+                                    "depthBox=${detection.depthBox}"
+                            )
+                        }
+
+                        // -------------------------------------------------------------
+                        // Release bitmap
+                        // -------------------------------------------------------------
+
+                        bitmap.recycle()
+
+                        // -------------------------------------------------------------
+                        // Return result to Flutter
+                        // -------------------------------------------------------------
+
+                        result.success(
+                            mapOf(
+                                "detections" to
+                                    output.map { it.toFlutterMap() },
+
+                                "latencyMs" to
+                                    detectLatencyMs
+                            )
+                        )
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            "MediaPipeLiveTest",
+                            "Live MediaPipe test failed",
+                            e
+                        )
+
+                        result.error(
+                            "MEDIAPIPE_LIVE_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                // =========================================================================
+                // STATIC MEDIAPIPE TEST
+                // =========================================================================
+
+                "testMediaPipeDetector" -> {
+
+                    try {
+
+                        val detector =
+                            com.hsv2.hsv2_lite.mediapipe.MediaPipeDetector(
+                                this
+                            )
+
+                        detector.initialize()
+
+                        val inputStream =
+                            assets.open(
+                                "test/bus.jpg"
+                            )
+
+                        val bitmap =
+                            android.graphics.BitmapFactory
+                                .decodeStream(
+                                    inputStream
+                                )
+
+                        inputStream.close()
+
+                        if (bitmap == null) {
+
+                            result.error(
+                                "IMAGE_ERROR",
+                                "Could not decode test/bus.jpg",
+                                null
+                            )
+
+                            return@setMethodCallHandler
+                        }
+
+                        val detections =
+                            detector.detect(
+                                bitmap,
+                                System.currentTimeMillis()
+                            )
+
+                        val output =
+                            detections.map {
+
+                                mapOf(
+                                    "class" to
+                                        it.className,
+
+                                    "score" to
+                                        it.score,
+
+                                    "left" to
+                                        it.left,
+
+                                    "top" to
+                                        it.top,
+
+                                    "right" to
+                                        it.right,
+
+                                    "bottom" to
+                                        it.bottom
+                                )
+                            }
+
+                        Log.i(
+                            LOG_TAG,
+                            "MediaPipe TEST RESULT: $output"
+                        )
+
+                        detector.close()
+
+                        bitmap.recycle()
+
+                        result.success(
+                            output
+                        )
+
+                    } catch (e: Exception) {
+
+                        Log.e(
+                            LOG_TAG,
+                            "MediaPipe test failed",
+                            e
+                        )
+
+                        result.error(
+                            "MEDIAPIPE_TEST_ERROR",
+                            e.message,
+                            null
+                        )
+                    }
+                }
+
+                else -> result.notImplemented()
+            }
+        }
+
+        // =========================================================================
+        // TELEMETRY CHANNEL
+        // =========================================================================
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            TELEMETRY_CHANNEL
+        ).setStreamHandler(
+
+            object : EventChannel.StreamHandler {
+
+                override fun onListen(
+                    arguments: Any?,
+                    events: EventChannel.EventSink?
+                ) {
+
+                    eventSink = events
+
+                    isPolling = true
+
+                    startPolling()
+                }
+
+                override fun onCancel(
+                    arguments: Any?
+                ) {
+
+                    eventSink = null
+
+                    isPolling = false
+                }
+            }
+        )
+
+        // =========================================================================
+        // USB STATUS CHANNEL
+        // =========================================================================
+
+        EventChannel(
+            flutterEngine.dartExecutor.binaryMessenger,
+            USB_STATUS_CHANNEL
+        ).setStreamHandler(
+
+            object : EventChannel.StreamHandler {
+
+                override fun onListen(
+                    arguments: Any?,
+                    events: EventChannel.EventSink?
+                ) {
+
+                    usbStatusSink = events
+
+                    checkUsbDevices()
+                }
+
+                override fun onCancel(
+                    arguments: Any?
+                ) {
+
+                    usbStatusSink = null
+                }
+            }
+        )
+    }
+
+    // =========================================================================
+    // ACTIVITY DESTROY
+    // =========================================================================
+
+    override fun onDestroy() {
+
+        liveMediaPipeDetector?.close()
+
+        liveMediaPipeDetector = null
+
+        super.onDestroy()
+
+        unregisterReceiver(
+            usbReceiver
+        )
+    }
+
+    // =========================================================================
+    // USB STATUS
+    // =========================================================================
+
+    private fun notifyUsbStatus(
+        status: String
+    ) {
+
+        handler.post {
+
+            usbStatusSink?.success(
+                status
+            )
+        }
+    }
+
+    // =========================================================================
+    // CHECK USB DEVICES
+    // =========================================================================
+
+    private fun checkUsbDevices() {
+
+        val deviceList =
+            usbManager.deviceList
+
+        var foundCamera = false
+
+        for (
+            device in deviceList.values
+        ) {
+
+            // Intel RealSense Vendor ID = 0x8086
+            if (
+                device.vendorId == 0x8086 ||
+                device.vendorId == 32902
+            ) {
+
+                foundCamera = true
+
+                Log.i(
+                    LOG_TAG,
+                    "Found Intel RealSense device"
+                )
+
+                if (
+                    usbManager.hasPermission(
+                        device
+                    )
+                ) {
+
+                    connectToDevice(
+                        device
+                    )
+
+                } else {
+
+                    Log.i(
+                        LOG_TAG,
+                        "Requesting USB permission"
+                    )
+
+                    notifyUsbStatus(
+                        "REQUESTING PERMISSION"
+                    )
+
+                    val flags =
+                        if (
+                            Build.VERSION.SDK_INT >=
+                                Build.VERSION_CODES.S
+                        ) {
+
+                            PendingIntent.FLAG_MUTABLE
+
+                        } else {
+
+                            0
+                        }
+
+                    val intent =
+                        Intent(
+                            ACTION_USB_PERMISSION
+                        )
+
+                    intent.setPackage(
+                        packageName
+                    )
+
+                    val permissionIntent =
+                        PendingIntent.getBroadcast(
+                            this,
+                            0,
+                            intent,
+                            flags
+                        )
+
+                    usbManager.requestPermission(
+                        device,
+                        permissionIntent
+                    )
+                }
+
+                break
+            }
+        }
+
+        if (!foundCamera) {
+
+            if (deviceList.isEmpty()) {
+
+                notifyUsbStatus(
+                    "DISCONNECTED (0 devices)"
+                )
+
+            } else {
+
+                val vids =
+                    deviceList.values.joinToString {
+                        it.vendorId.toString()
+                    }
+
+                notifyUsbStatus(
+                    "DISCONNECTED (VIDs: $vids)"
+                )
+            }
+        }
+    }
+
+    // =========================================================================
+    // CONNECT REALSENSE DEVICE
+    // =========================================================================
+
+    private fun connectToDevice(
+        device: UsbDevice
+    ) {
+
+        val connection =
+            usbManager.openDevice(
+                device
+            )
+
+        if (connection != null) {
+
+            val fd =
+                connection.fileDescriptor
+
+            val usbfsPath =
+                device.deviceName
+
+            Log.i(
+                LOG_TAG,
+                "USB Device opened successfully. " +
+                    "FD: $fd, Path: $usbfsPath"
+            )
+
+            // Pass FD to C++
+            try {
+
+                val success =
+                    initRealSenseWithFD(
+                        fd,
+                        usbfsPath
+                    )
+
+                if (success) {
+
+                    notifyUsbStatus(
+                        "CONNECTED"
+                    )
+
+                } else {
+
+                    Log.e(
+                        LOG_TAG,
+                        "C++ initRealSenseWithFD failed"
+                    )
+
+                    notifyUsbStatus(
+                        "OPEN FAILED"
+                    )
+                }
+
+            } catch (e: Exception) {
+
+                Log.e(
+                    LOG_TAG,
+                    "Native initRealSenseWithFD call failed",
+                    e
+                )
+
+                notifyUsbStatus(
+                    "OPEN FAILED"
+                )
+            }
+
+        } else {
+
+            Log.e(
+                LOG_TAG,
+                "Failed to open USB device"
+            )
+
+            notifyUsbStatus(
+                "OPEN FAILED"
+            )
+        }
+    }
+
+    // =========================================================================
+    // TELEMETRY POLLING
+    // =========================================================================
+
+    private fun startPolling() {
+
+        handler.post(
+            object : Runnable {
+
+                override fun run() {
+
+                    if (isPolling) {
+
+                        try {
+
+                            var telemetryJson =
+                                pollTelemetry()
+
+                            if (
+                                telemetryJson != "{}"
+                            ) {
+
+                                try {
+                                    val battery =
+                                        getBatteryLevelPercent()
+
+                                    val batteryTemperature =
+                                        getBatteryTemperatureCelsius()
+
+                                    if (telemetryJson.endsWith("}")) {
+                                        telemetryJson =
+                                            telemetryJson.dropLast(1) +
+                                            ",\"battery\":$battery" +
+                                            ",\"batteryTemperature\":$batteryTemperature}"
+                                    }
+
+                                } catch (e: Exception) {
+                                    Log.e(
+                                        LOG_TAG,
+                                        "Failed to read live battery telemetry",
+                                        e
+                                    )
+                                }
+
+                                eventSink?.success(
+                                    telemetryJson
+                                )
+                            }
+
+                        } catch (e: Exception) {
+
+                            Log.e(
+                                LOG_TAG,
+                                "Native pollTelemetry failed",
+                                e
+                            )
+                        }
+
+                        handler.postDelayed(
+                            this,
+                            100
+                        )
+                    }
+                }
+            }
+        )
+    }
+}

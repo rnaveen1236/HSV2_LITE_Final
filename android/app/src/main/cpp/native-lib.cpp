@@ -1,15 +1,23 @@
+#include <iomanip>
+#include <sstream>
 #include <jni.h>
+#include "librealsense/third-party/json.hpp"
 #include <string>
 #include <android/log.h>
+#include "vio/vio_engine.h"
+#include "librealsense/src/ds5/ds5-motion.h"
+#include "librealsense/src/ds5/ds5-color.h"
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <array>
 #include <vector>
 #include <deque>
 #include <cstring>
 #include <chrono>
+#include <random>
 #include <algorithm>
 #include <cmath>
 #include <fstream>
@@ -17,14 +25,35 @@
 #include <sys/stat.h>
 
 #include <librealsense2/rs.hpp>
+#include <opencv2/core.hpp>
+#include <opencv2/imgproc.hpp>
+#include <opencv2/features2d.hpp>
+#include <opencv2/video/tracking.hpp>
+#include <opencv2/calib3d.hpp>
+
 #include <librealsense2/rsutil.h>
 #include <android/asset_manager.h>
 #include <android/asset_manager_jni.h>
 
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, "HSV2Native", __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, "HSV2Native", __VA_ARGS__)
+#define LOGW(...) __android_log_print(ANDROID_LOG_WARN, "HSV2Native", __VA_ARGS__)
 
 int currentStage = 1;
+
+// Stage 2 runtime decimation.
+// 2x is the default baseline; 4x is selectable for Stage 2.7 comparison.
+std::atomic<int> stage2_decimation(2);
+
+// Actual VIO integration engine.
+hsv2::VioEngine g_vio_engine;
+
+// Persist the selected D455 IMU stream profiles so camera<->IMU
+// calibration/extrinsics can be queried after sensor startup.
+rs2::stream_profile g_d455_gyro_profile;
+rs2::stream_profile g_d455_accel_profile;
+bool g_d455_imu_profiles_valid = false;
+
 bool isCameraInitialized = false;
 
 // ============================================================================
@@ -100,11 +129,46 @@ float depth_scale = 0.001f;
 bool calibration_ready = false;
 
 // ============================================================================
+// STAGE 2.1 - DEPTH ALIGNMENT
+// Align D455 depth into the RGB/color coordinate system.
+// This is isolated to Stage 2 and does not modify P3.2.
+// ============================================================================
+static rs2::align stage2_align_to_color(RS2_STREAM_COLOR);
+
+
+// ============================================================================
 // Telemetry state
 // ============================================================================
 
 std::mutex telemetry_mutex;
 char telemetry_json[4096] = "{}";
+
+// ============================================================================
+// FUSION STATE
+// Stage 1 object + Stage 2 depth/3D + Stage 4 VIO-shaped workload metadata.
+// Kotlin updates the latest Stage 1 object results; the native frame loop
+// combines them with the current Stage 2 and Stage 4 results.
+// ============================================================================
+
+struct FusionDetection {
+    std::string class_name;
+    float score = 0.0f;
+
+    float distance_m = 0.0f;
+    float x_m = 0.0f;
+    float y_m = 0.0f;
+    float z_m = 0.0f;
+
+    std::string direction;
+    std::string horizontal_direction;
+    float angle_deg = 0.0f;
+
+    bool depth_valid = false;
+};
+
+static std::mutex fusion_detection_mutex;
+static std::vector<FusionDetection> latest_fusion_detections;
+static uint64_t latest_fusion_detection_timestamp_ms = 0;
 
 // ============================================================
 // LIVE LATENCY HISTORY
@@ -394,6 +458,315 @@ int latest_depth_height = 0;
 double latest_depth_timestamp_ms = 0.0;
 
 unsigned long long latest_depth_frame_num = 0;
+
+// ============================================================================
+// P3.1 Ground Plane State
+// ============================================================================
+
+struct P31GroundPlane {
+    float nx = 0.0f;
+    float ny = 0.0f;
+    float nz = 0.0f;
+    float d = 0.0f;
+
+    int inliers = 0;
+    int sampled_points = 0;
+
+    float mean_error_m = 0.0f;
+
+    bool valid = false;
+    bool using_fallback = false;
+};
+
+std::mutex ground_plane_mutex;
+P31GroundPlane latest_ground_plane;
+
+constexpr int P31_RANSAC_ITERATIONS = 80;
+constexpr int P31_MAX_RANSAC_POINTS = 6000;
+
+constexpr float P31_PLANE_DISTANCE_THRESHOLD_M = 0.020f;
+
+constexpr float P31_MIN_DEPTH_M = 0.30f;
+constexpr float P31_MAX_DEPTH_M = 5.00f;
+
+constexpr int P31_MIN_GROUND_INLIERS = 1200;
+
+constexpr int P31_MAX_CONSECUTIVE_FALLBACKS = 15;
+constexpr float P31_MAX_PLANE_D_DELTA_M = 0.40f;
+
+int p31_consecutive_fallbacks = 0;
+
+// P3.1 performance: run the expensive RANSAC estimation
+// every 3rd depth frame (~5 Hz at a 15 FPS camera rate).
+// The latest valid plane is reused between RANSAC updates.
+int p31_frame_counter = 0;
+constexpr int P31_UPDATE_EVERY_N_FRAMES = 3;
+
+
+// ============================================================================
+// P3.1 Ground Plane RANSAC
+// ============================================================================
+
+static bool fitP31PlaneFromPoints(
+        const rs2::depth_frame& depth_frame,
+        P31GroundPlane& output) {
+
+    if (!depth_frame || !calibration_ready) {
+        return false;
+    }
+
+    const int width = depth_frame.get_width();
+    const int height = depth_frame.get_height();
+
+    if (width <= 0 || height <= 0) {
+        return false;
+    }
+
+    std::vector<std::array<float, 3>> points;
+    points.reserve(P31_MAX_RANSAC_POINTS);
+
+    // Sample the lower/middle image region where the ground plane is
+    // expected to be visible. Decimation keeps the computation bounded.
+    constexpr int STEP = 2;
+
+    for (int y = height / 3; y < height; y += STEP) {
+        for (int x = 0; x < width; x += STEP) {
+
+            const float depth_m =
+                    depth_frame.get_distance(x, y);
+
+            if (depth_m < P31_MIN_DEPTH_M ||
+                depth_m > P31_MAX_DEPTH_M) {
+                continue;
+            }
+
+            float pixel[2] = {
+                    static_cast<float>(x),
+                    static_cast<float>(y)
+            };
+
+            float point[3] = {};
+
+            rs2_deproject_pixel_to_point(
+                    point,
+                    &depth_intrinsics,
+                    pixel,
+                    depth_m);
+
+            if (!std::isfinite(point[0]) ||
+                !std::isfinite(point[1]) ||
+                !std::isfinite(point[2])) {
+                continue;
+            }
+
+            points.push_back({
+                    point[0],
+                    point[1],
+                    point[2]
+            });
+
+            if (static_cast<int>(points.size()) >=
+                P31_MAX_RANSAC_POINTS) {
+                break;
+            }
+        }
+
+        if (static_cast<int>(points.size()) >=
+            P31_MAX_RANSAC_POINTS) {
+            break;
+        }
+    }
+
+    if (points.size() < 3) {
+        return false;
+    }
+
+    std::mt19937 rng(12345);
+    std::uniform_int_distribution<size_t> distribution(
+            0,
+            points.size() - 1);
+
+    int best_inliers = 0;
+    float best_error = std::numeric_limits<float>::max();
+
+    float best_nx = 0.0f;
+    float best_ny = 0.0f;
+    float best_nz = 0.0f;
+    float best_d = 0.0f;
+
+    for (int iteration = 0;
+         iteration < P31_RANSAC_ITERATIONS;
+         ++iteration) {
+
+        const auto& p1 = points[distribution(rng)];
+        const auto& p2 = points[distribution(rng)];
+        const auto& p3 = points[distribution(rng)];
+
+        const float ax = p2[0] - p1[0];
+        const float ay = p2[1] - p1[1];
+        const float az = p2[2] - p1[2];
+
+        const float bx = p3[0] - p1[0];
+        const float by = p3[1] - p1[1];
+        const float bz = p3[2] - p1[2];
+
+        float nx = ay * bz - az * by;
+        float ny = az * bx - ax * bz;
+        float nz = ax * by - ay * bx;
+
+        const float norm =
+                std::sqrt(nx * nx + ny * ny + nz * nz);
+
+        if (norm < 1e-6f) {
+            continue;
+        }
+
+        nx /= norm;
+        ny /= norm;
+        nz /= norm;
+
+        float d =
+                -(nx * p1[0] +
+                  ny * p1[1] +
+                  nz * p1[2]);
+
+        // Keep the normal orientation consistent with the camera frame.
+        if (ny > 0.0f) {
+            nx = -nx;
+            ny = -ny;
+            nz = -nz;
+            d = -d;
+        }
+
+        int inliers = 0;
+        double error_sum = 0.0;
+
+        for (const auto& point : points) {
+
+            const float distance =
+                    std::fabs(
+                            nx * point[0] +
+                            ny * point[1] +
+                            nz * point[2] +
+                            d);
+
+            if (distance <=
+                P31_PLANE_DISTANCE_THRESHOLD_M) {
+
+                ++inliers;
+                error_sum += distance;
+            }
+        }
+
+        const float mean_error =
+                inliers > 0
+                        ? static_cast<float>(
+                                error_sum /
+                                static_cast<double>(inliers))
+                        : std::numeric_limits<float>::max();
+
+        if (inliers > best_inliers ||
+            (inliers == best_inliers &&
+             mean_error < best_error)) {
+
+            best_inliers = inliers;
+            best_error = mean_error;
+
+            best_nx = nx;
+            best_ny = ny;
+            best_nz = nz;
+            best_d = d;
+        }
+    }
+
+    output.nx = best_nx;
+    output.ny = best_ny;
+    output.nz = best_nz;
+    output.d = best_d;
+    output.inliers = best_inliers;
+    output.sampled_points =
+            static_cast<int>(points.size());
+    output.mean_error_m =
+            best_error;
+
+    return best_inliers >= P31_MIN_GROUND_INLIERS;
+}
+
+static bool runP31GroundPlane(
+        const rs2::depth_frame& depth_frame,
+        P31GroundPlane& output) {
+
+    // Reuse the latest valid plane between RANSAC updates.
+    ++p31_frame_counter;
+    if ((p31_frame_counter % P31_UPDATE_EVERY_N_FRAMES) != 0) {
+        std::lock_guard<std::mutex> lock(ground_plane_mutex);
+        output = latest_ground_plane;
+        return output.valid;
+    }
+
+    P31GroundPlane candidate;
+
+    if (!fitP31PlaneFromPoints(
+                depth_frame,
+                candidate)) {
+
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        ++p31_consecutive_fallbacks;
+
+        if (p31_consecutive_fallbacks <=
+            P31_MAX_CONSECUTIVE_FALLBACKS &&
+            latest_ground_plane.valid) {
+
+            latest_ground_plane.using_fallback = true;
+        } else {
+            latest_ground_plane.valid = false;
+            latest_ground_plane.using_fallback = false;
+        }
+
+        return false;
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        // Reject an implausibly large sudden plane-distance change.
+        if (latest_ground_plane.valid) {
+
+            const float previous_d =
+                    latest_ground_plane.d;
+
+            if (std::fabs(candidate.d - previous_d) >
+                P31_MAX_PLANE_D_DELTA_M) {
+
+                ++p31_consecutive_fallbacks;
+
+                if (p31_consecutive_fallbacks <=
+                    P31_MAX_CONSECUTIVE_FALLBACKS) {
+
+                    latest_ground_plane.using_fallback = true;
+                } else {
+                    latest_ground_plane.valid = false;
+                    latest_ground_plane.using_fallback = false;
+                }
+
+                return false;
+            }
+        }
+
+        candidate.valid = true;
+        candidate.using_fallback = false;
+
+        latest_ground_plane = candidate;
+
+        p31_consecutive_fallbacks = 0;
+    }
+
+    return true;
+}
+
 
 // ============================================================================
 // IMU sync logger state
@@ -686,130 +1059,1312 @@ void stopImuSyncLogger() {
 
 
 // ============================================================================
-// Stage 4: VIO-shaped concurrent CPU workload
+// ============================================================================
+// Stage 4: Dynamic VIO-shaped visual compute
 // ============================================================================
 //
-// This is a representative synthetic workload for ladder testing.
-// It is NOT a production VIO implementation.
+// This is a dynamic visual-tracking workload driven by REAL D455 RGB frames.
 //
-// It performs image-gradient-style sampling followed by repeated small
-// matrix/vector numerical operations. The work is executed on a separate
-// thread so that it overlaps the main D455/MediaPipe pipeline.
+// Pipeline:
+//   RGBA frame
+//      -> grayscale
+//      -> FAST feature detection
+//      -> LK optical-flow tracking
+//      -> essential matrix
+//      -> recoverPose
+//      -> depth-backed local 3D point processing
+//      -> keyframe/local-point maintenance
+//
+// IMPORTANT:
+// This is NOT a production VIO / SLAM implementation.
+// It is a dynamic VIO-shaped concurrent compute stage.
+// The existing VioEngine remains separate.
 // ============================================================================
 
-struct Stage4Result {
-    double processing_ms;
-    double checksum;
+struct Stage4DynamicResult {
+    bool processed = false;
+    bool pose_valid = false;
+
+    // 0 = no pose, 1 = essential/recoverPose,
+    // 2 = homography fallback.
+    int pose_mode = 0;
+
+    int features = 0;
+    int tracked = 0;
+    int inliers = 0;
+    int local_points = 0;
+
+    double tx = 0.0;
+    double ty = 0.0;
+    double tz = 0.0;
+
+    double processing_ms = 0.0;
 };
 
-static Stage4Result run_stage4_vio_shaped_workload(
-        const rs2::video_frame& color_frame) {
 
-    Stage4Result result{};
-    const auto start = std::chrono::steady_clock::now();
+struct Stage4DetectionBox {
+    float left = 0.0f;
+    float top = 0.0f;
+    float right = 0.0f;
+    float bottom = 0.0f;
+};
 
-    if (!color_frame) {
-        return result;
+static std::mutex stage4_detection_boxes_mutex;
+
+static std::vector<Stage4DetectionBox>
+        latest_stage4_detection_boxes;
+
+static void detectStage4FastFeatures(
+        const cv::Mat& gray,
+        std::vector<cv::Point2f>& points,
+        int threshold = 20,
+        size_t maximum = 300) {
+
+    points.clear();
+
+    if (gray.empty() || maximum == 0) {
+        return;
     }
 
-    const int width = color_frame.get_width();
-    const int height = color_frame.get_height();
+    // Snapshot the latest live MediaPipe detection boxes.
+    std::vector<Stage4DetectionBox> boxes;
 
-    const auto* data =
-            static_cast<const uint8_t*>(color_frame.get_data());
+    {
+        std::lock_guard<std::mutex> lock(
+                stage4_detection_boxes_mutex);
 
-    if (!data || width < 8 || height < 8) {
-        return result;
+        boxes = latest_stage4_detection_boxes;
     }
 
-    double checksum = 0.0;
+    // No MediaPipe detection -> no background FAST features.
+    if (boxes.empty()) {
+        return;
+    }
 
-    // Image-gradient / feature-tracking style sampling.
-    // Sample every 4 pixels to keep the workload deterministic.
-    for (int y = 2; y < height - 2; y += 4) {
-        for (int x = 2; x < width - 2; x += 4) {
+    const int width = gray.cols;
+    const int height = gray.rows;
 
-            const int idx = (y * width + x) * 4;
+    std::vector<cv::KeyPoint> keypoints;
 
-            const double gx =
-                    static_cast<double>(data[idx + 4]) -
-                    static_cast<double>(data[idx - 4]);
+    // Run FAST only inside live MediaPipe detection regions.
+    for (const auto& box : boxes) {
 
-            const double gy =
-                    static_cast<double>(data[idx + width * 4]) -
-                    static_cast<double>(data[idx - width * 4]);
+        const int left = std::clamp(
+                static_cast<int>(std::floor(box.left)),
+                0,
+                width - 1);
 
-            const double magnitude =
-                    std::sqrt(gx * gx + gy * gy);
+        const int top = std::clamp(
+                static_cast<int>(std::floor(box.top)),
+                0,
+                height - 1);
 
-            checksum += magnitude;
+        const int right = std::clamp(
+                static_cast<int>(std::ceil(box.right)),
+                0,
+                width);
+
+        const int bottom = std::clamp(
+                static_cast<int>(std::ceil(box.bottom)),
+                0,
+                height);
+
+        if (right <= left || bottom <= top) {
+            continue;
+        }
+
+        const cv::Rect roi(
+                left,
+                top,
+                right - left,
+                bottom - top);
+
+        std::vector<cv::KeyPoint> roi_keypoints;
+
+        cv::FAST(
+                gray(roi),
+                roi_keypoints,
+                threshold,
+                true);
+
+        for (auto& kp : roi_keypoints) {
+
+            // Convert ROI coordinates back to full RGB coordinates.
+            kp.pt.x += static_cast<float>(left);
+            kp.pt.y += static_cast<float>(top);
+
+            keypoints.push_back(kp);
         }
     }
 
-    // Small iterative matrix/vector workload representative of
-    // VIO state propagation / optimization-style numerical processing.
-    double state[9] = {
-        1.0, 0.1, 0.2,
-        0.1, 1.0, 0.3,
-        0.2, 0.3, 1.0
-    };
-
-    double vector[3] = {
-        checksum * 0.000001,
-        checksum * 0.000002,
-        checksum * 0.000003
-    };
-
-    for (int iteration = 0; iteration < 80; ++iteration) {
-
-        double next[3];
-
-        next[0] =
-                state[0] * vector[0] +
-                state[1] * vector[1] +
-                state[2] * vector[2];
-
-        next[1] =
-                state[3] * vector[0] +
-                state[4] * vector[1] +
-                state[5] * vector[2];
-
-        next[2] =
-                state[6] * vector[0] +
-                state[7] * vector[1] +
-                state[8] * vector[2];
-
-        vector[0] = next[0] + 0.0001;
-        vector[1] = next[1] + 0.0002;
-        vector[2] = next[2] + 0.0003;
-
-        // Lightweight state update.
-        state[0] += 0.000001;
-        state[4] += 0.000001;
-        state[8] += 0.000001;
+    if (keypoints.empty()) {
+        return;
     }
 
-    checksum += vector[0] + vector[1] + vector[2];
+    // Strongest FAST features first.
+    std::sort(
+            keypoints.begin(),
+            keypoints.end(),
+            [](const cv::KeyPoint& a,
+               const cv::KeyPoint& b) {
+                return a.response > b.response;
+            });
 
-    result.checksum = checksum;
+    // Remove duplicate/nearby points from overlapping ROIs.
+    constexpr float MIN_DISTANCE = 4.0f;
+    constexpr float MIN_DISTANCE_SQ =
+            MIN_DISTANCE * MIN_DISTANCE;
 
-    const auto end = std::chrono::steady_clock::now();
-    result.processing_ms =
-            std::chrono::duration<double, std::milli>(end - start).count();
+    points.reserve(
+            std::min(keypoints.size(), maximum));
 
-    return result;
+    for (const auto& kp : keypoints) {
+
+        bool duplicate = false;
+
+        for (const auto& selected : points) {
+
+            const float dx =
+                    kp.pt.x - selected.x;
+
+            const float dy =
+                    kp.pt.y - selected.y;
+
+            if ((dx * dx + dy * dy) <
+                    MIN_DISTANCE_SQ) {
+
+                duplicate = true;
+                break;
+            }
+        }
+
+        if (duplicate) {
+            continue;
+        }
+
+        points.push_back(kp.pt);
+
+        if (points.size() >= maximum) {
+            break;
+        }
+    }
 }
 
-struct Stage2Result {
-    double processing_ms;
-    size_t valid_points;
-    size_t voxel_count;
+
+// ============================================================================
+// STAGE 4 VISUALIZATION SNAPSHOT
+// UI-only diagnostic snapshot.
+// Does NOT replace or modify the Stage 4 benchmark path.
+// ============================================================================
+
+struct Stage4VisualizationSnapshot {
+    bool valid = false;
+
+    double processing_ms = 0.0;
+
+    int features = 0;
+    int tracked = 0;
+    int inliers = 0;
+    int local_points = 0;
+
+    bool pose_valid = false;
+    int pose_mode = 0;
+
+    double tx = 0.0;
+    double ty = 0.0;
+    double tz = 0.0;
+
+    int rgb_width = 0;
+    int rgb_height = 0;
+
+    std::vector<cv::Point2f> feature_points;
+    std::vector<std::array<float, 3>> local_3d;
 };
 
+
+// ============================================================================
+// STAGE 4 OBJECT-DETECTION ROI
+// MediaPipe supplies live RGB bounding boxes.
+// FAST feature extraction is restricted to these detected regions.
+// ============================================================================
+
+static std::mutex stage4_visualization_mutex;
+
+static Stage4VisualizationSnapshot
+        latest_stage4_visualization;
+
+class Stage4DynamicTracker {
+public:
+
+    Stage4DynamicTracker() = default;
+
+    Stage4DynamicResult process(
+            const rs2::video_frame& color_frame,
+            const rs2::depth_frame& depth_frame) {
+
+        Stage4DynamicResult result;
+
+        if (!color_frame) {
+            return result;
+        }
+
+        std::unique_lock<std::mutex> lock(
+                m_mutex,
+                std::try_to_lock);
+
+        // Keep the Stage 4 queue bounded.
+        // If the previous frame is still being processed,
+        // drop this frame instead of building an unbounded backlog.
+        if (!lock.owns_lock()) {
+            return result;
+        }
+
+        const auto start =
+                std::chrono::steady_clock::now();
+
+        const int width =
+                color_frame.get_width();
+
+        const int height =
+                color_frame.get_height();
+
+        const auto* rgba =
+                static_cast<const uint8_t*>(
+                        color_frame.get_data());
+
+        if (!rgba ||
+            width < 32 ||
+            height < 32) {
+            return result;
+        }
+
+        // --------------------------------------------------------------------
+        // 1. RGBA -> grayscale
+        // --------------------------------------------------------------------
+
+        cv::Mat rgba_mat(
+                height,
+                width,
+                CV_8UC4,
+                const_cast<uint8_t*>(rgba));
+
+        cv::Mat gray;
+
+        cv::cvtColor(
+                rgba_mat,
+                gray,
+                cv::COLOR_RGBA2GRAY);
+
+        // --------------------------------------------------------------------
+        // 2. Get actual D455 RGB intrinsics
+        // --------------------------------------------------------------------
+
+        try {
+
+            auto color_profile =
+                    color_frame.get_profile()
+                            .as<rs2::video_stream_profile>();
+
+            const rs2_intrinsics intrinsics =
+                    color_profile.get_intrinsics();
+
+            m_fx = intrinsics.fx;
+            m_fy = intrinsics.fy;
+            m_cx = intrinsics.ppx;
+            m_cy = intrinsics.ppy;
+
+        } catch (...) {
+
+            // If calibration is temporarily unavailable,
+            // use image-center fallback.
+            if (m_fx <= 0.0 || m_fy <= 0.0) {
+                m_fx = static_cast<double>(width);
+                m_fy = static_cast<double>(width);
+                m_cx = width * 0.5;
+                m_cy = height * 0.5;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 3. First frame: initialize dynamic feature state
+        // --------------------------------------------------------------------
+
+        if (m_previous_gray.empty()) {
+
+            detectStage4FastFeatures(
+                    gray,
+                    m_previous_points,
+                    20,
+                    300);
+
+            m_previous_gray = gray.clone();
+
+            m_frame_count++;
+
+            result.processed = true;
+
+            result.features =
+                    static_cast<int>(
+                            m_previous_points.size());
+
+            // Store REAL D455 metric XYZ corresponding
+            // to the initial FAST feature points.
+            m_previous_points_3d.clear();
+
+            result.local_points =
+                    buildLocalDepthPoints(
+                            depth_frame,
+                            m_previous_points,
+                            &m_previous_points_3d);
+
+            // Initial camera frame = persistent world frame.
+            m_world_R =
+                    cv::Mat::eye(3, 3, CV_64F);
+
+            m_world_t =
+                    cv::Mat::zeros(3, 1, CV_64F);
+
+            m_metric_pose_initialized = true;
+
+            result.pose_valid = true;
+            result.pose_mode = 3;
+
+            result.tx = 0.0;
+            result.ty = 0.0;
+            result.tz = 0.0;
+
+            result.processing_ms =
+                    elapsedMs(start);
+
+            return result;
+        }
+
+        // --------------------------------------------------------------------
+        // 4. LK optical-flow tracking
+        // --------------------------------------------------------------------
+
+        if (m_previous_points.size() < 50) {
+
+            detectStage4FastFeatures(
+                    m_previous_gray,
+                    m_previous_points,
+                    20,
+                    300);
+        }
+
+        std::vector<cv::Point2f> current_points;
+        std::vector<uint8_t> status;
+        std::vector<float> error;
+
+        if (!m_previous_points.empty()) {
+
+            cv::calcOpticalFlowPyrLK(
+                    m_previous_gray,
+                    gray,
+                    m_previous_points,
+                    current_points,
+                    status,
+                    error,
+                    cv::Size(21, 21),
+                    3,
+                    cv::TermCriteria(
+                            cv::TermCriteria::COUNT |
+                            cv::TermCriteria::EPS,
+                            30,
+                            0.01),
+                    0,
+                    0.001);
+        }
+
+        std::vector<cv::Point2f> prev_good;
+        std::vector<cv::Point2f> curr_good;
+        std::vector<cv::Point3f> prev_good_3d;
+
+        // Snapshot the latest live MediaPipe object ROIs once per frame.
+        std::vector<Stage4DetectionBox> current_detection_boxes;
+
+        {
+            std::lock_guard<std::mutex> roi_lock(
+                    stage4_detection_boxes_mutex);
+
+            current_detection_boxes =
+                    latest_stage4_detection_boxes;
+        }
+
+        const size_t n =
+                std::min(
+                        current_points.size(),
+                        status.size());
+
+        for (size_t i = 0; i < n; ++i) {
+
+            if (!status[i]) {
+                continue;
+            }
+
+            const cv::Point2f& p0 =
+                    m_previous_points[i];
+
+            const cv::Point2f& p1 =
+                    current_points[i];
+
+            if (!insideImage(
+                        p0,
+                        width,
+                        height) ||
+                !insideImage(
+                        p1,
+                        width,
+                        height)) {
+                continue;
+            }
+
+            const float dx =
+                    p1.x - p0.x;
+
+            const float dy =
+                    p1.y - p0.y;
+
+            const float motion =
+                    std::sqrt(
+                            dx * dx +
+                            dy * dy);
+
+            // Reject obvious LK outliers.
+            if (motion > 80.0f) {
+                continue;
+            }
+
+            // ------------------------------------------------------------
+            // OBJECT-SPECIFIC TRACK FILTER
+            //
+            // Keep an LK track only when its current position lies inside
+            // at least one live MediaPipe detection ROI.
+            // ------------------------------------------------------------
+
+            bool inside_object_roi = false;
+
+            for (const auto& box :
+                    current_detection_boxes) {
+
+                const float left =
+                        std::max(
+                                0.0f,
+                                std::min(
+                                        box.left,
+                                        static_cast<float>(width)));
+
+                const float top =
+                        std::max(
+                                0.0f,
+                                std::min(
+                                        box.top,
+                                        static_cast<float>(height)));
+
+                const float right =
+                        std::max(
+                                left,
+                                std::min(
+                                        box.right,
+                                        static_cast<float>(width)));
+
+                const float bottom =
+                        std::max(
+                                top,
+                                std::min(
+                                        box.bottom,
+                                        static_cast<float>(height)));
+
+                if (p1.x >= left &&
+                    p1.x <= right &&
+                    p1.y >= top &&
+                    p1.y <= bottom) {
+
+                    inside_object_roi = true;
+                    break;
+                }
+            }
+
+            if (!inside_object_roi) {
+                continue;
+            }
+
+            // Require a valid REAL D455 depth-backed
+            // metric 3D point for this previous feature.
+            if (i >= m_previous_points_3d.size()) {
+                continue;
+            }
+
+            const auto& xyz =
+                    m_previous_points_3d[i];
+
+            // The indexed D455 depth array contains one XYZ slot
+            // for every previous FAST point. Invalid depth is NaN.
+            if (!std::isfinite(xyz[0]) ||
+                !std::isfinite(xyz[1]) ||
+                !std::isfinite(xyz[2]) ||
+                xyz[2] <= 0.05f ||
+                xyz[2] > 10.0f) {
+                continue;
+            }
+
+            prev_good.push_back(p0);
+            curr_good.push_back(p1);
+
+            // REAL metric D455 XYZ -> current RGB pixel.
+            prev_good_3d.emplace_back(
+                    xyz[0],
+                    xyz[1],
+                    xyz[2]);
+        }
+
+        result.features =
+                static_cast<int>(
+                        m_previous_points.size());
+
+        result.tracked =
+                static_cast<int>(
+                        curr_good.size());
+
+        // --------------------------------------------------------------------
+        // 5. METRIC RGB-D POSE ESTIMATION
+        //
+        // Previous-frame D455 depth gives metric XYZ.
+        // Current-frame RGB gives the corresponding 2D image point.
+        //
+        // solvePnPRansac estimates:
+        //
+        //     X_current = R * X_previous + t
+        //
+        // Translation t is metric because the input 3D points
+        // come directly from the D455 depth sensor.
+        //
+        // No recoverPose() / homography translation is used for
+        // persistent metric mapping.
+        // --------------------------------------------------------------------
+
+        if (prev_good_3d.size() >= 6 &&
+            curr_good.size() == prev_good_3d.size()) {
+
+            cv::Mat camera_matrix =
+                    (cv::Mat_<double>(3, 3)
+                            << m_fx, 0.0, m_cx,
+                               0.0, m_fy, m_cy,
+                               0.0, 0.0, 1.0);
+
+            std::vector<cv::Point3f> object_points =
+                    prev_good_3d;
+
+            std::vector<cv::Point2f> image_points =
+                    curr_good;
+
+            cv::Mat rvec;
+            cv::Mat tvec;
+            cv::Mat pnp_inliers;
+
+            bool pnp_ok = false;
+
+            try {
+
+                pnp_ok =
+                        cv::solvePnPRansac(
+                                object_points,
+                                image_points,
+                                camera_matrix,
+                                cv::Mat(),
+                                rvec,
+                                tvec,
+                                false,
+                                100,
+                                4.0,
+                                0.99,
+                                pnp_inliers,
+                                cv::SOLVEPNP_ITERATIVE);
+
+            } catch (...) {
+
+                pnp_ok = false;
+            }
+
+            const int pnp_inlier_count =
+                    pnp_inliers.rows;
+
+            m_metric_pose_inliers =
+                    pnp_inlier_count;
+
+            // ------------------------------------------------------------
+            // Reprojection-error validation
+            // ------------------------------------------------------------
+
+            double reprojection_error = 1e9;
+
+            if (pnp_ok &&
+                !rvec.empty() &&
+                !tvec.empty() &&
+                pnp_inlier_count >= 6) {
+
+                std::vector<cv::Point2f> projected_points;
+
+                try {
+
+                    cv::projectPoints(
+                            object_points,
+                            rvec,
+                            tvec,
+                            camera_matrix,
+                            cv::Mat(),
+                            projected_points);
+
+                    double error_sum = 0.0;
+                    int error_count = 0;
+
+                    for (int k = 0;
+                         k < pnp_inlier_count;
+                         ++k) {
+
+                        const int idx =
+                                pnp_inliers.at<int>(k, 0);
+
+                        if (idx < 0 ||
+                            idx >=
+                                static_cast<int>(
+                                    projected_points.size())) {
+                            continue;
+                        }
+
+                        const double dx =
+                                projected_points[idx].x -
+                                image_points[idx].x;
+
+                        const double dy =
+                                projected_points[idx].y -
+                                image_points[idx].y;
+
+                        const double error =
+                                std::sqrt(
+                                        dx * dx +
+                                        dy * dy);
+
+                        if (std::isfinite(error)) {
+                            error_sum += error;
+                            error_count++;
+                        }
+                    }
+
+                    if (error_count > 0) {
+                        reprojection_error =
+                                error_sum /
+                                static_cast<double>(
+                                        error_count);
+                    }
+
+                } catch (...) {
+
+                    reprojection_error = 1e9;
+                }
+            }
+
+            m_metric_pose_reprojection_error =
+                    reprojection_error;
+
+            // ------------------------------------------------------------
+            // Pose quality gate
+            //
+            // We only accept metric pose when:
+            //   - enough 3D/2D correspondences exist
+            //   - PnP has enough inliers
+            //   - reprojection error is small
+            // ------------------------------------------------------------
+
+            const bool pose_quality_ok =
+                    pnp_ok &&
+                    pnp_inlier_count >= 15 &&
+                    std::isfinite(
+                            reprojection_error) &&
+                    reprojection_error <= 4.0;
+
+            if (pose_quality_ok) {
+
+                cv::Mat R_current_previous;
+
+                cv::Rodrigues(
+                        rvec,
+                        R_current_previous);
+
+                // --------------------------------------------------------
+                // Physical translation sanity check.
+                //
+                // A single frame-to-frame D455 motion greater than
+                // 0.50 m is rejected for this lightweight tracker.
+                // --------------------------------------------------------
+
+                const double translation_magnitude =
+                        cv::norm(tvec);
+
+                const bool translation_reasonable =
+                        std::isfinite(
+                                translation_magnitude) &&
+                        translation_magnitude <= 0.50;
+
+                if (translation_reasonable) {
+
+                    result.pose_valid = true;
+                    result.pose_mode = 3;
+
+                    result.inliers =
+                            pnp_inlier_count;
+
+                    // solvePnP gives:
+                    //
+                    // X_current =
+                    //      R_current_previous * X_previous
+                    //      + t_current_previous
+                    //
+                    // Convert this into the persistent world pose.
+                    //
+                    // World frame starts as frame 0.
+                    // Therefore:
+                    //
+                    // T_world_current =
+                    //      T_world_previous *
+                    //      inverse(T_current_previous)
+
+                    cv::Mat R_prev_current =
+                            R_current_previous.t();
+
+                    cv::Mat t_prev_current =
+                            -R_prev_current * tvec;
+
+                    if (!m_metric_pose_initialized) {
+
+                        m_world_R =
+                                cv::Mat::eye(
+                                        3, 3,
+                                        CV_64F);
+
+                        m_world_t =
+                                cv::Mat::zeros(
+                                        3, 1,
+                                        CV_64F);
+
+                        m_metric_pose_initialized =
+                                true;
+                    }
+
+                    cv::Mat new_world_R =
+                            m_world_R *
+                            R_prev_current;
+
+                    cv::Mat new_world_t =
+                            m_world_R *
+                            t_prev_current +
+                            m_world_t;
+
+                    m_world_R =
+                            new_world_R.clone();
+
+                    m_world_t =
+                            new_world_t.clone();
+
+                    // Report the metric frame-to-frame translation.
+                    result.tx =
+                            tvec.at<double>(0, 0);
+
+                    result.ty =
+                            tvec.at<double>(1, 0);
+
+                    result.tz =
+                            tvec.at<double>(2, 0);
+
+                } else {
+
+                    result.pose_valid = false;
+                    result.pose_mode = 0;
+                    result.inliers = 0;
+                }
+
+            } else {
+
+                // IMPORTANT:
+                // Invalid PnP must NOT update persistent world pose.
+                result.pose_valid = false;
+                result.pose_mode = 0;
+                result.inliers =
+                        pnp_inlier_count;
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 6. Depth-backed local 3D processing
+        // --------------------------------------------------------------------
+
+        std::vector<std::array<float, 3>> local_3d_points;
+
+        result.local_points =
+                buildLocalDepthPoints(
+                        depth_frame,
+                        curr_good,
+                        &local_3d_points);
+
+        // --------------------------------------------------------------------
+        // 7. Dynamic keyframe decision
+        // --------------------------------------------------------------------
+
+        bool create_keyframe = false;
+
+        if (m_frame_count % 30 == 0) {
+            create_keyframe = true;
+        }
+
+        if (result.tracked < 80) {
+            create_keyframe = true;
+        }
+
+        if (create_keyframe) {
+
+            // Create a new FAST keyframe from the CURRENT RGB frame.
+            std::vector<cv::Point2f> new_keyframe_points;
+
+            detectStage4FastFeatures(
+                    gray,
+                    new_keyframe_points,
+                    20,
+                    300);
+
+            // Build REAL D455 metric XYZ for exactly the same
+            // keyframe points so 2D <-> 3D indexing stays aligned.
+            std::vector<std::array<float, 3>> new_keyframe_points_3d;
+
+            buildLocalDepthPoints(
+                    depth_frame,
+                    new_keyframe_points,
+                    &new_keyframe_points_3d);
+
+            // Keep only points for which a valid D455 XYZ exists.
+            std::vector<cv::Point2f> valid_keyframe_points;
+            std::vector<std::array<float, 3>> valid_keyframe_points_3d;
+
+            const size_t keyframe_count =
+                    std::min(
+                            new_keyframe_points.size(),
+                            new_keyframe_points_3d.size());
+
+            valid_keyframe_points.reserve(keyframe_count);
+            valid_keyframe_points_3d.reserve(keyframe_count);
+
+            for (size_t i = 0;
+                 i < keyframe_count;
+                 ++i) {
+
+                const auto& xyz =
+                        new_keyframe_points_3d[i];
+
+                if (!std::isfinite(xyz[0]) ||
+                    !std::isfinite(xyz[1]) ||
+                    !std::isfinite(xyz[2]) ||
+                    xyz[2] <= 0.05f ||
+                    xyz[2] > 10.0f) {
+                    continue;
+                }
+
+                valid_keyframe_points.push_back(
+                        new_keyframe_points[i]);
+
+                valid_keyframe_points_3d.push_back(
+                        xyz);
+            }
+
+            m_previous_points =
+                    std::move(
+                            valid_keyframe_points);
+
+            m_previous_points_3d =
+                    std::move(
+                            valid_keyframe_points_3d);
+
+            m_keyframe_count++;
+
+        } else {
+
+            // For normal LK tracking, curr_good and the
+            // corresponding current D455 depth-backed 3D
+            // points become the next previous-frame state.
+            std::vector<std::array<float, 3>>
+                    current_points_3d;
+
+            buildLocalDepthPoints(
+                    depth_frame,
+                    curr_good,
+                    &current_points_3d);
+
+            const size_t current_count =
+                    std::min(
+                            curr_good.size(),
+                            current_points_3d.size());
+
+            m_previous_points.clear();
+            m_previous_points_3d.clear();
+
+            m_previous_points.reserve(
+                    current_count);
+
+            m_previous_points_3d.reserve(
+                    current_count);
+
+            for (size_t i = 0;
+                 i < current_count;
+                 ++i) {
+
+                const auto& xyz =
+                        current_points_3d[i];
+
+                if (!std::isfinite(xyz[0]) ||
+                    !std::isfinite(xyz[1]) ||
+                    !std::isfinite(xyz[2]) ||
+                    xyz[2] <= 0.05f ||
+                    xyz[2] > 10.0f) {
+                    continue;
+                }
+
+                m_previous_points.push_back(
+                        curr_good[i]);
+
+                m_previous_points_3d.push_back(
+                        xyz);
+            }
+        }
+
+        // --------------------------------------------------------------------
+        // 8. Update persistent frame state
+        // --------------------------------------------------------------------
+
+        m_previous_gray =
+                gray.clone();
+
+        m_frame_count++;
+
+        result.processed = true;
+
+        result.processing_ms =
+                elapsedMs(start);
+
+        // --------------------------------------------------------------------
+        // 9. Update UI-only Stage 4 visualization snapshot
+        // --------------------------------------------------------------------
+
+        {
+            std::lock_guard<std::mutex> visualization_lock(
+                    stage4_visualization_mutex);
+
+            latest_stage4_visualization.valid =
+                    result.processed;
+
+            latest_stage4_visualization.processing_ms =
+                    result.processing_ms;
+
+            latest_stage4_visualization.features =
+                    result.features;
+
+            latest_stage4_visualization.tracked =
+                    result.tracked;
+
+            latest_stage4_visualization.inliers =
+                    result.inliers;
+
+            latest_stage4_visualization.local_points =
+                    result.local_points;
+
+            latest_stage4_visualization.pose_valid =
+                    result.pose_valid;
+
+            latest_stage4_visualization.pose_mode =
+                    result.pose_mode;
+
+            latest_stage4_visualization.tx =
+                    result.tx;
+
+            latest_stage4_visualization.ty =
+                    result.ty;
+
+            latest_stage4_visualization.tz =
+                    result.tz;
+
+            latest_stage4_visualization.rgb_width =
+                    width;
+
+            latest_stage4_visualization.rgb_height =
+                    height;
+
+            latest_stage4_visualization.feature_points =
+                    m_previous_points;
+
+            latest_stage4_visualization.local_3d =
+                    local_3d_points;
+        }
+
+        return result;
+    }
+
+private:
+
+    static double elapsedMs(
+            const std::chrono::steady_clock::time_point& start) {
+
+        const auto end =
+                std::chrono::steady_clock::now();
+
+        return std::chrono::duration<double, std::milli>(
+                end - start).count();
+    }
+
+    static bool insideImage(
+            const cv::Point2f& p,
+            int width,
+            int height) {
+
+        return
+                p.x >= 2.0f &&
+                p.y >= 2.0f &&
+                p.x < static_cast<float>(width - 2) &&
+                p.y < static_cast<float>(height - 2);
+    }
+
+    static void limitFeatures(
+            std::vector<cv::Point2f>& points,
+            size_t maximum) {
+
+        if (points.size() <= maximum) {
+            return;
+        }
+
+        points.resize(maximum);
+    }
+
+    int buildLocalDepthPoints(
+            const rs2::depth_frame& depth_frame,
+            const std::vector<cv::Point2f>& points,
+            std::vector<std::array<float, 3>>* output_points = nullptr) {
+
+        // IMPORTANT:
+        // output_points preserves EXACTLY one XYZ slot for every
+        // input image feature.
+        //
+        // Invalid depth is represented by NaN XYZ.
+        // This keeps:
+        //
+        //     image_point[i] <-> xyz_point[i]
+        //
+        // correctly indexed for RGB-D PnP.
+
+        if (output_points != nullptr) {
+            output_points->clear();
+
+            output_points->resize(
+                    points.size(),
+                    {
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN(),
+                        std::numeric_limits<float>::quiet_NaN()
+                    });
+        }
+
+        if (!depth_frame) {
+            return 0;
+        }
+
+        const int width =
+                depth_frame.get_width();
+
+        const int height =
+                depth_frame.get_height();
+
+        if (width <= 0 || height <= 0) {
+            return 0;
+        }
+
+        const auto* depth_data =
+                static_cast<const uint16_t*>(
+                        depth_frame.get_data());
+
+        if (!depth_data) {
+            return 0;
+        }
+
+        // Use the actual D455 depth scale.
+        float depth_scale = 0.001f;
+
+        try {
+
+            depth_scale =
+                    depth_frame.get_units();
+
+        } catch (...) {
+
+            depth_scale = 0.001f;
+        }
+
+        if (depth_scale <= 0.0f) {
+            depth_scale = 0.001f;
+        }
+
+        int valid = 0;
+
+        for (size_t index = 0;
+             index < points.size();
+             ++index) {
+
+            const auto& p =
+                    points[index];
+
+            const int x =
+                    static_cast<int>(
+                            std::round(p.x));
+
+            const int y =
+                    static_cast<int>(
+                            std::round(p.y));
+
+            if (x < 1 ||
+                y < 1 ||
+                x >= width - 1 ||
+                y >= height - 1) {
+                continue;
+            }
+
+            const uint16_t d0 =
+                    depth_data[y * width + x];
+
+            if (d0 == 0) {
+                continue;
+            }
+
+            const float z =
+                    static_cast<float>(d0) *
+                    depth_scale;
+
+            if (z <= 0.05f ||
+                z > 10.0f) {
+                continue;
+            }
+
+            // RGB-camera metric 3D reconstruction.
+            const float X =
+                    static_cast<float>(
+                            (p.x - m_cx) *
+                            z / m_fx);
+
+            const float Y =
+                    static_cast<float>(
+                            (p.y - m_cy) *
+                            z / m_fy);
+
+            if (!std::isfinite(X) ||
+                !std::isfinite(Y) ||
+                !std::isfinite(z)) {
+                continue;
+            }
+
+            if (output_points != nullptr) {
+
+                // Preserve EXACT input index.
+                (*output_points)[index] = {
+                    X,
+                    Y,
+                    z
+                };
+            }
+
+            m_local_checksum +=
+                    static_cast<double>(X) * 0.001 +
+                    static_cast<double>(Y) * 0.002 +
+                    static_cast<double>(z) * 0.003;
+
+            valid++;
+        }
+
+        return valid;
+    }
+
+    std::mutex m_mutex;
+
+    cv::Mat m_previous_gray;
+
+    std::vector<cv::Point2f>
+            m_previous_points;
+
+    // Previous FAST points expressed as REAL D455 metric XYZ.
+    std::vector<std::array<float, 3>>
+            m_previous_points_3d;
+
+    // Persistent metric camera pose.
+    bool m_metric_pose_initialized = false;
+
+    cv::Mat m_world_R =
+            cv::Mat::eye(3, 3, CV_64F);
+
+    cv::Mat m_world_t =
+            cv::Mat::zeros(3, 1, CV_64F);
+
+    int m_metric_pose_inliers = 0;
+
+    double m_metric_pose_reprojection_error = 0.0;
+
+    double m_fx = 0.0;
+    double m_fy = 0.0;
+    double m_cx = 0.0;
+    double m_cy = 0.0;
+
+    uint64_t m_frame_count = 0;
+    uint64_t m_keyframe_count = 0;
+
+    double m_local_checksum = 0.0;
+};
+
+static Stage4DynamicTracker g_stage4_dynamic_tracker;
+
+struct Stage2Point {
+    float x;
+    float y;
+    float z;
+};
+
+struct Stage2Voxel {
+    int vx;
+    int vy;
+    int vz;
+};
+
+struct Stage2Result {
+    double processing_ms = 0.0;
+    size_t valid_points = 0;
+    size_t voxel_count = 0;
+
+    // Stage 2.6 frame association.
+    // These identify the RGB/depth frameset used for this Stage 2 snapshot.
+    uint64_t rgb_frame_number = 0;
+    double rgb_timestamp_ms = 0.0;
+    uint64_t depth_frame_number = 0;
+    double depth_timestamp_ms = 0.0;
+
+    // Bounded visualization samples.
+    // These are intentionally much smaller than the complete
+    // decimated point cloud to avoid MethodChannel/UI overhead.
+    std::vector<Stage2Point> visualization_points;
+    std::vector<Stage2Voxel> visualization_voxels;
+};
+
+// Latest Stage 2 snapshot for the dedicated visualization screen.
+// Updated by the streaming thread and read by the JNI/UI thread.
+static std::mutex stage2_visualization_mutex;
+static Stage2Result latest_stage2_result;
+static bool stage2_visualization_valid = false;
+
 static Stage2Result run_stage2_voxel_workload(
-        const rs2::depth_frame& depth_frame) {
+        const rs2::depth_frame& depth_frame,
+        const rs2_intrinsics& stage2_intrinsics) {
 
     Stage2Result result{};
+
     const auto start = std::chrono::steady_clock::now();
 
     if (!depth_frame || !calibration_ready) {
@@ -824,10 +2379,14 @@ static Stage2Result run_stage2_voxel_workload(
     }
 
     // ------------------------------------------------------------------------
-    // 2x decimation
+    // Stage 2.3
+    // Decimation
+    //
+    // Keep the full computation at 2x for the baseline.
+    // 4x will be added as a selectable measurement mode later.
     // ------------------------------------------------------------------------
 
-    constexpr int DECIMATION = 2;
+    const int DECIMATION = stage2_decimation.load();
 
     const int width = src_width / DECIMATION;
     const int height = src_height / DECIMATION;
@@ -836,14 +2395,31 @@ static Stage2Result run_stage2_voxel_workload(
         return result;
     }
 
-    // Single-frame voxel grid.
-    // Voxel size = 20 mm.
+    // ------------------------------------------------------------------------
+    // Stage 2.4
+    // Single-frame voxel grid
+    //
+    // Current baseline voxel size remains 20 mm so that this rework
+    // does not silently change the existing Stage 2 measurement.
+    // ------------------------------------------------------------------------
+
     constexpr float VOXEL_SIZE_M = 0.020f;
 
     std::vector<uint64_t> voxels;
+
     voxels.reserve(
             static_cast<size_t>(width) *
             static_cast<size_t>(height) / 4);
+
+    // Full valid point-cloud visualization.
+    // 640x480 @ 2x decimation = up to 76,800 points.
+    // 640x480 @ 4x decimation = up to 19,200 points.
+    // Keep a larger ceiling so visualization is not artificially truncated.
+    constexpr size_t MAX_VIS_POINTS = 307200;
+    constexpr size_t MAX_VIS_VOXELS = 3000;
+
+    result.visualization_points.reserve(MAX_VIS_POINTS);
+    result.visualization_voxels.reserve(MAX_VIS_VOXELS);
 
     for (int y = 0; y < height; ++y) {
 
@@ -869,9 +2445,28 @@ static Stage2Result run_stage2_voxel_workload(
 
             rs2_deproject_pixel_to_point(
                     point,
-                    &depth_intrinsics,
+                    &stage2_intrinsics,
                     pixel,
                     depth_m);
+
+            ++result.valid_points;
+
+            // ---------------------------------------------------------------
+            // Stage 2.2
+            // Full valid 3D point-cloud visualization.
+            //
+            // Every valid deprojected point is sent to the visualization.
+            // No stride-based visualization thinning.
+            // ---------------------------------------------------------------
+
+            if (result.visualization_points.size() < MAX_VIS_POINTS) {
+
+                result.visualization_points.push_back({
+                        point[0],
+                        point[1],
+                        point[2]
+                });
+            }
 
             const int vx = static_cast<int>(
                     std::floor(point[0] / VOXEL_SIZE_M));
@@ -903,18 +2498,54 @@ static Stage2Result run_stage2_voxel_workload(
                     (uz & 0x1FFFFFULL);
 
             voxels.push_back(key);
-
-            ++result.valid_points;
         }
     }
 
-    // Sort + unique gives the occupied single-frame voxel set.
+    // ------------------------------------------------------------------------
+    // Single-frame occupied voxel set
+    // ------------------------------------------------------------------------
+
     std::sort(voxels.begin(), voxels.end());
+
     voxels.erase(
             std::unique(voxels.begin(), voxels.end()),
             voxels.end());
 
     result.voxel_count = voxels.size();
+
+    // ------------------------------------------------------------------------
+    // Decode a bounded voxel sample for visualization.
+    // ------------------------------------------------------------------------
+
+    constexpr int OFFSET = 1000000;
+
+    const size_t voxel_step =
+            voxels.size() > MAX_VIS_VOXELS
+                    ? (voxels.size() / MAX_VIS_VOXELS)
+                    : 1;
+
+    for (size_t i = 0;
+         i < voxels.size() &&
+         result.visualization_voxels.size() < MAX_VIS_VOXELS;
+         i += voxel_step) {
+
+        const uint64_t key = voxels[i];
+
+        const int64_t ux =
+                static_cast<int64_t>((key >> 42) & 0x3FFFFFULL);
+
+        const int64_t uy =
+                static_cast<int64_t>((key >> 21) & 0x1FFFFFULL);
+
+        const int64_t uz =
+                static_cast<int64_t>(key & 0x1FFFFFULL);
+
+        result.visualization_voxels.push_back({
+                static_cast<int>(ux - OFFSET),
+                static_cast<int>(uy - OFFSET),
+                static_cast<int>(uz - OFFSET)
+        });
+    }
 
     const auto end = std::chrono::steady_clock::now();
 
@@ -1399,6 +3030,260 @@ static bool mapColorBoxToDepthBox(
     return true;
 }
 
+
+
+// ============================================================================
+// ============================================================================
+// P3.2.3: DEPTH PIXEL + P3.2.2 MEDIAN DEPTH -> D455 CAMERA XYZ
+// ============================================================================
+
+static bool deprojectDepthPixelToXYZ(
+        float depth_x,
+        float depth_y,
+        float depth_m,
+        float& x_m,
+        float& y_m,
+        float& z_m) {
+
+    x_m = 0.0f;
+    y_m = 0.0f;
+    z_m = 0.0f;
+
+    if (!calibration_ready) {
+        LOGE("P3.2.3: calibration not ready");
+        return false;
+    }
+
+    if (!std::isfinite(depth_x) ||
+        !std::isfinite(depth_y) ||
+        !std::isfinite(depth_m)) {
+
+        LOGE("P3.2.3: invalid pixel/depth input");
+        return false;
+    }
+
+    if (depth_m <= 0.10f ||
+        depth_m >= 10.0f) {
+
+        LOGE(
+                "P3.2.3: invalid depth %.3f m",
+                depth_m);
+
+        return false;
+    }
+
+    const float pixel[2] = {
+            depth_x,
+            depth_y
+    };
+
+    float point[3] = {};
+
+    rs2_deproject_pixel_to_point(
+            point,
+            &depth_intrinsics,
+            pixel,
+            depth_m);
+
+    if (!std::isfinite(point[0]) ||
+        !std::isfinite(point[1]) ||
+        !std::isfinite(point[2])) {
+
+        LOGE(
+                "P3.2.3: deprojection returned "
+                "non-finite XYZ");
+
+        return false;
+    }
+
+    x_m = point[0];
+    y_m = point[1];
+    z_m = point[2];
+
+    LOGI(
+            "P3.2.3: center=(%.1f,%.1f) "
+            "depth=%.3f m XYZ=[%.3f,%.3f,%.3f]",
+            depth_x,
+            depth_y,
+            depth_m,
+            x_m,
+            y_m,
+            z_m);
+
+    return true;
+}
+
+// ============================================================================
+// P3.2.5: OBJECT XYZ -> GROUND-PLANE CROSS-CHECK
+// ============================================================================
+
+static bool checkP325ObjectAgainstGroundPlane(
+        float x_m,
+        float y_m,
+        float z_m,
+        float& plane_distance_m,
+        bool& plane_valid,
+        bool& using_fallback) {
+
+    plane_distance_m = 0.0f;
+    plane_valid = false;
+    using_fallback = false;
+
+    if (!std::isfinite(x_m) ||
+        !std::isfinite(y_m) ||
+        !std::isfinite(z_m)) {
+
+        LOGW("P3.2.5: invalid XYZ input");
+        return false;
+    }
+
+    P31GroundPlane plane;
+
+    {
+        std::lock_guard<std::mutex> lock(
+                ground_plane_mutex);
+
+        plane = latest_ground_plane;
+    }
+
+    plane_valid = plane.valid;
+    using_fallback = plane.using_fallback;
+
+    if (!plane.valid) {
+        LOGW("P3.2.5: ground plane unavailable");
+        return false;
+    }
+
+    const float distance =
+            std::fabs(
+                    plane.nx * x_m +
+                    plane.ny * y_m +
+                    plane.nz * z_m +
+                    plane.d);
+
+    if (!std::isfinite(distance)) {
+        LOGW("P3.2.5: invalid plane distance");
+        return false;
+    }
+
+    plane_distance_m = distance;
+
+    LOGI(
+            "P3.2.5: XYZ=[%.3f,%.3f,%.3f] "
+            "plane_distance=%.3f m valid=%d fallback=%d",
+            x_m,
+            y_m,
+            z_m,
+            plane_distance_m,
+            plane_valid ? 1 : 0,
+            using_fallback ? 1 : 0);
+
+    return true;
+}
+
+
+// ============================================================================
+
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_checkP325ObjectAgainstGroundPlane(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jfloat x_m,
+        jfloat y_m,
+        jfloat z_m) {
+
+    float plane_distance_m = 0.0f;
+    bool plane_valid = false;
+    bool using_fallback = false;
+
+    const bool success =
+            checkP325ObjectAgainstGroundPlane(
+                    x_m,
+                    y_m,
+                    z_m,
+                    plane_distance_m,
+                    plane_valid,
+                    using_fallback);
+
+    if (!success && !plane_valid) {
+        return nullptr;
+    }
+
+    jfloatArray output =
+            env->NewFloatArray(3);
+
+    if (output == nullptr) {
+        return nullptr;
+    }
+
+    const jfloat result[3] = {
+            plane_distance_m,
+            plane_valid ? 1.0f : 0.0f,
+            using_fallback ? 1.0f : 0.0f
+    };
+
+    env->SetFloatArrayRegion(
+            output,
+            0,
+            3,
+            result);
+
+    return output;
+}
+
+// ============================================================================
+
+// ============================================================================
+
+extern "C"
+JNIEXPORT jfloatArray JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_deprojectDepthPixelToXYZ(
+        JNIEnv* env,
+        jobject /* thiz */,
+        jfloat depth_x,
+        jfloat depth_y,
+        jfloat depth_m) {
+
+    float x_m = 0.0f;
+    float y_m = 0.0f;
+    float z_m = 0.0f;
+
+    const bool success =
+            deprojectDepthPixelToXYZ(
+                    depth_x,
+                    depth_y,
+                    depth_m,
+                    x_m,
+                    y_m,
+                    z_m);
+
+    if (!success) {
+        return nullptr;
+    }
+
+    jfloatArray output =
+            env->NewFloatArray(3);
+
+    if (output == nullptr) {
+        return nullptr;
+    }
+
+    const jfloat xyz[3] = {
+            x_m,
+            y_m,
+            z_m
+    };
+
+    env->SetFloatArrayRegion(
+            output,
+            0,
+            3,
+            xyz);
+
+    return output;
+}
+
 // ============================================================================
 // JNI BRIDGE: RGB BOX -> DEPTH BOX
 // ============================================================================
@@ -1494,6 +3379,204 @@ Java_com_intel_realsense_librealsense_DeviceWatcher_nAddUsbDevice(
 // INIT REALSENSE
 // ============================================================================
 
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setStage4DetectionBoxes(
+        JNIEnv* env,
+        jobject /* this */,
+        jfloatArray boxes_array) {
+
+    std::vector<Stage4DetectionBox> boxes;
+
+    if (boxes_array != nullptr) {
+
+        const jsize length =
+                env->GetArrayLength(boxes_array);
+
+        if (length >= 4) {
+
+            std::vector<jfloat> values(
+                    static_cast<size_t>(length));
+
+            env->GetFloatArrayRegion(
+                    boxes_array,
+                    0,
+                    length,
+                    values.data());
+
+            for (jsize i = 0; i + 3 < length; i += 4) {
+
+                Stage4DetectionBox box;
+
+                box.left = values[i];
+                box.top = values[i + 1];
+                box.right = values[i + 2];
+                box.bottom = values[i + 3];
+
+                boxes.push_back(box);
+            }
+        }
+    }
+
+    {
+        std::lock_guard<std::mutex> lock(
+                stage4_detection_boxes_mutex);
+
+        latest_stage4_detection_boxes =
+                std::move(boxes);
+    }
+
+    LOGI(
+            "STAGE4_ROI: received %zu detection boxes",
+            latest_stage4_detection_boxes.size());
+}
+
+// ============================================================================
+// FUSION - RECEIVE STAGE 1 OBJECT RESULTS
+// Kotlin sends the already-computed MediaPipe + D455 values as JSON.
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setFusionDetections(
+        JNIEnv* env,
+        jobject /* this */,
+        jstring detections_json) {
+
+    std::vector<FusionDetection> parsed_detections;
+    const uint64_t timestamp_ms =
+            static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now().time_since_epoch())
+                            .count());
+
+    if (detections_json == nullptr) {
+        std::lock_guard<std::mutex> lock(
+                fusion_detection_mutex);
+
+        latest_fusion_detections.clear();
+        latest_fusion_detection_timestamp_ms = 0;
+
+        LOGI("FUSION: received null detection JSON");
+        return;
+    }
+
+    const char* json_chars =
+            env->GetStringUTFChars(
+                    detections_json,
+                    nullptr);
+
+    if (json_chars == nullptr) {
+        LOGE("FUSION: failed to read detection JSON");
+        return;
+    }
+
+    try {
+        const nlohmann::json root =
+                nlohmann::json::parse(json_chars);
+
+        if (!root.is_array()) {
+            LOGE("FUSION: expected detection JSON array");
+            env->ReleaseStringUTFChars(
+                    detections_json,
+                    json_chars);
+            return;
+        }
+
+        for (const auto& item : root) {
+            if (!item.is_object()) {
+                continue;
+            }
+
+            FusionDetection detection;
+
+            detection.class_name =
+                    item.value("class", "");
+
+            detection.score =
+                    item.value("score", 0.0f);
+
+            // Nullable depth/3D fields are kept at their struct defaults
+            // when Kotlin reports JSONObject.NULL. Do not convert null
+            // measurements into fake zero-distance values.
+            if (item.find("distanceMeters") != item.end() &&
+                item["distanceMeters"].is_number()) {
+                detection.distance_m =
+                        item["distanceMeters"].get<float>();
+            }
+
+            if (item.find("xMeters") != item.end() &&
+                item["xMeters"].is_number()) {
+                detection.x_m =
+                        item["xMeters"].get<float>();
+            }
+
+            if (item.find("yMeters") != item.end() &&
+                item["yMeters"].is_number()) {
+                detection.y_m =
+                        item["yMeters"].get<float>();
+            }
+
+            if (item.find("zMeters") != item.end() &&
+                item["zMeters"].is_number()) {
+                detection.z_m =
+                        item["zMeters"].get<float>();
+            }
+
+            detection.direction =
+                    item.value("direction", "");
+
+            detection.horizontal_direction =
+                    item.value("horizontalDirection", "");
+
+            if (item.find("angleDegrees") != item.end() &&
+                item["angleDegrees"].is_number()) {
+                detection.angle_deg =
+                        item["angleDegrees"].get<float>();
+            }
+
+            detection.depth_valid =
+                    item.value("groundPlaneValid", false);
+
+            if (detection.class_name.empty()) {
+                continue;
+            }
+
+            parsed_detections.push_back(
+                    std::move(detection));
+        }
+
+    } catch (const std::exception& e) {
+        LOGE(
+                "FUSION: JSON parse failed: %s",
+                e.what());
+
+        env->ReleaseStringUTFChars(
+                detections_json,
+                json_chars);
+        return;
+    }
+
+    env->ReleaseStringUTFChars(
+            detections_json,
+            json_chars);
+
+    {
+        std::lock_guard<std::mutex> lock(
+                fusion_detection_mutex);
+
+        latest_fusion_detections =
+                std::move(parsed_detections);
+
+        latest_fusion_detection_timestamp_ms =
+                timestamp_ms;
+    }
+
+    LOGI(
+            "FUSION: parsed %zu detections",
+            latest_fusion_detections.size());
+}
+
+
 extern "C" JNIEXPORT jboolean JNICALL
 Java_com_hsv2_hsv2_1lite_MainActivity_initRealSenseWithFD(
         JNIEnv* env,
@@ -1553,19 +3636,168 @@ Java_com_hsv2_hsv2_1lite_MainActivity_initRealSenseWithFD(
     return JNI_TRUE;
 }
 
+
 // ============================================================================
-// START D455 IMU SENSOR SEPARATELY FROM RGB/DEPTH PIPELINE
+// D455 CAMERA <-> IMU CALIBRATION QUERY
 // ============================================================================
+
+bool queryD455VioCalibration(
+    const rs2::pipeline_profile& pipeline_profile)
+{
+    LOGI("VIO CALIB TRACE: ENTER queryD455VioCalibration()");
+
+    try
+    {
+        auto* d455_motion =
+            librealsense::ds5_motion::get_active_vio_instance();
+
+        auto* d455_color =
+            librealsense::get_active_d455_vio_color_instance();
+
+        if (!d455_motion || !d455_color)
+        {
+            LOGI(
+                "VIO CALIB TRACE: active instance missing motion=%s color=%s",
+                d455_motion ? "VALID" : "NULL",
+                d455_color ? "VALID" : "NULL");
+            return false;
+        }
+
+        LOGI(
+            "VIO CALIB TRACE: active ds5_motion + ds5_color obtained");
+
+        rs2_extrinsics color_to_depth{};
+        rs2_extrinsics depth_to_imu{};
+
+        LOGI(
+            "VIO CALIB TRACE: BEFORE color_to_depth accessor");
+
+        const bool color_depth_ok =
+            d455_color->get_vio_color_to_depth_extrinsics(
+                color_to_depth);
+
+        LOGI(
+            "VIO CALIB TRACE: AFTER color_to_depth accessor result=%s",
+            color_depth_ok ? "SUCCESS" : "FAILED");
+
+        if (!color_depth_ok)
+        {
+            LOGI(
+                "VIO CALIB TRACE: color_to_depth accessor failed");
+            return false;
+        }
+
+        LOGI(
+            "VIO_COLOR_TO_DEPTH: t=[%.6f %.6f %.6f]",
+            color_to_depth.translation[0],
+            color_to_depth.translation[1],
+            color_to_depth.translation[2]);
+
+        LOGI(
+            "VIO CALIB TRACE: BEFORE depth_to_imu accessor");
+
+        const bool depth_imu_ok =
+            d455_motion->get_vio_depth_to_imu_extrinsics(
+                depth_to_imu);
+
+        LOGI(
+            "VIO CALIB TRACE: AFTER depth_to_imu accessor result=%s",
+            depth_imu_ok ? "SUCCESS" : "FAILED");
+
+        if (!depth_imu_ok)
+        {
+            LOGI(
+                "VIO CALIB TRACE: depth_to_imu accessor failed");
+            return false;
+        }
+
+        LOGI(
+            "VIO_DEPTH_TO_IMU: t=[%.6f %.6f %.6f]",
+            depth_to_imu.translation[0],
+            depth_to_imu.translation[1],
+            depth_to_imu.translation[2]);
+
+        // Compose Color -> Depth and Depth -> IMU:
+        //
+        // R_ci = R_di * R_cd
+        // t_ci = R_di * t_cd + t_di
+
+        rs2_extrinsics color_to_imu{};
+
+        for (int r = 0; r < 3; ++r)
+        {
+            for (int c = 0; c < 3; ++c)
+            {
+                color_to_imu.rotation[r * 3 + c] = 0.0f;
+
+                for (int k = 0; k < 3; ++k)
+                {
+                    color_to_imu.rotation[r * 3 + c] +=
+                        depth_to_imu.rotation[r * 3 + k] *
+                        color_to_depth.rotation[k * 3 + c];
+                }
+            }
+        }
+
+        for (int r = 0; r < 3; ++r)
+        {
+            color_to_imu.translation[r] =
+                depth_to_imu.translation[r];
+
+            for (int k = 0; k < 3; ++k)
+            {
+                color_to_imu.translation[r] +=
+                    depth_to_imu.rotation[r * 3 + k] *
+                    color_to_depth.translation[k];
+            }
+        }
+
+        LOGI(
+            "VIO_COLOR_TO_IMU: t=[%.6f %.6f %.6f]",
+            color_to_imu.translation[0],
+            color_to_imu.translation[1],
+            color_to_imu.translation[2]);
+
+        LOGI(
+            "VIO CALIB TRACE: Color->Depth + Depth->IMU composition SUCCESS");
+
+        return true;
+    }
+    catch (const rs2::error& e)
+    {
+        LOGI(
+            "VIO CALIB TRACE: RealSense error: %s",
+            e.what());
+        return false;
+    }
+    catch (const std::exception& e)
+    {
+        LOGI(
+            "VIO CALIB TRACE: std::exception: %s",
+            e.what());
+        return false;
+    }
+    catch (...)
+    {
+        LOGI(
+            "VIO CALIB TRACE: unknown exception");
+        return false;
+    }
+}
 
 bool startD455ImuSensor()
 {
+    LOGI("D455 IMU TRACE: ENTER startD455ImuSensor()");
+
     if (!rs_ctx) {
         LOGE("IMU start skipped: RealSense context unavailable");
         return false;
     }
 
     try {
+        LOGI("D455 IMU TRACE: BEFORE query_devices()");
         auto devices = rs_ctx->query_devices();
+        LOGI("D455 IMU TRACE: AFTER query_devices()");
 
         if (devices.size() == 0) {
             LOGE("IMU start failed: no RealSense device found");
@@ -1574,7 +3806,9 @@ bool startD455ImuSensor()
 
         rs2::device device = devices.front();
 
+        LOGI("D455 IMU TRACE: BEFORE query_sensors()");
         auto sensors = device.query_sensors();
+        LOGI("D455 IMU TRACE: AFTER query_sensors()");
 
         for (auto&& sensor : sensors) {
 
@@ -1638,13 +3872,26 @@ bool startD455ImuSensor()
                 continue;
             }
 
+            // Persist the selected profiles for VIO calibration/extrinsics queries.
+            g_d455_gyro_profile = selected_gyro;
+            g_d455_accel_profile = selected_accel;
+            g_d455_imu_profiles_valid = true;
+
+            LOGI(
+                    "VIO IMU profiles saved: gyro_fps=%d accel_fps=%d",
+                    selected_gyro.fps(),
+                    selected_accel.fps());
+
             std::vector<rs2::stream_profile> imu_profiles;
             imu_profiles.push_back(selected_gyro);
             imu_profiles.push_back(selected_accel);
 
-            motion.open(imu_profiles);
+            LOGI("D455 IMU TRACE: BEFORE motion.open()");
+        motion.open(imu_profiles);
+        LOGI("D455 IMU TRACE: AFTER motion.open()");
 
-            motion.start(
+            LOGI("D455 IMU TRACE: BEFORE motion.start()");
+        motion.start(
                     [](rs2::frame frame) {
 
                 try {
@@ -1676,6 +3923,14 @@ bool startD455ImuSensor()
 
                         latest_gyro_data =
                                 motion_data;
+
+                        // Feed the real D455 gyro sample into VIO.
+                        g_vio_engine.addGyro(
+                                timestamp_ms,
+                                hsv2::Vec3{
+                                        motion_data.x,
+                                        motion_data.y,
+                                        motion_data.z});
 
                         const auto count =
                                 ++imu_gyro_count;
@@ -1709,6 +3964,14 @@ bool startD455ImuSensor()
 
                         latest_accel_data =
                                 motion_data;
+
+                        // Feed the real D455 accelerometer sample into VIO.
+                        g_vio_engine.addAccel(
+                                timestamp_ms,
+                                hsv2::Vec3{
+                                        motion_data.x,
+                                        motion_data.y,
+                                        motion_data.z});
 
                         const auto count =
                                 ++imu_accel_count;
@@ -1766,6 +4029,124 @@ bool startD455ImuSensor()
 // ============================================================================
 // FIXED TEST SEQUENCE RECORDING
 // ============================================================================
+
+
+// ============================================================================
+// STAGE 4 VISUALIZATION SNAPSHOT
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_getStage4Visualization(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(
+            stage4_visualization_mutex);
+
+    const Stage4VisualizationSnapshot& data =
+            latest_stage4_visualization;
+
+    std::ostringstream json;
+
+    json << std::fixed << std::setprecision(4);
+
+    json << "{";
+
+    json << "\"valid\":"
+         << (data.valid ? "true" : "false") << ",";
+
+    json << "\"processingMs\":"
+         << data.processing_ms << ",";
+
+    json << "\"features\":"
+         << data.features << ",";
+
+    json << "\"tracked\":"
+         << data.tracked << ",";
+
+    json << "\"inliers\":"
+         << data.inliers << ",";
+
+    json << "\"localPoints\":"
+         << data.local_points << ",";
+
+    json << "\"poseValid\":"
+         << (data.pose_valid ? "true" : "false") << ",";
+
+    json << "\"poseMode\":"
+         << data.pose_mode << ",";
+
+    json << "\"tx\":"
+         << data.tx << ",";
+
+    json << "\"ty\":"
+         << data.ty << ",";
+
+    json << "\"tz\":"
+         << data.tz << ",";
+
+    json << "\"rgbWidth\":"
+         << data.rgb_width << ",";
+
+    json << "\"rgbHeight\":"
+         << data.rgb_height << ",";
+
+    // ------------------------------------------------------------------------
+    // 2D feature points
+    // ------------------------------------------------------------------------
+
+    json << "\"features2d\":[";
+
+    for (size_t i = 0;
+         i < data.feature_points.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const cv::Point2f& point =
+                data.feature_points[i];
+
+        json << "["
+             << point.x << ","
+             << point.y
+             << "]";
+    }
+
+    json << "],";
+
+    // ------------------------------------------------------------------------
+    // Depth-backed local 3D points
+    // ------------------------------------------------------------------------
+
+    json << "\"local3d\":[";
+
+    for (size_t i = 0;
+         i < data.local_3d.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const std::array<float, 3>& point =
+                data.local_3d[i];
+
+        json << "["
+             << point[0] << ","
+             << point[1] << ","
+             << point[2]
+             << "]";
+    }
+
+    json << "]";
+
+    json << "}";
+
+    return env->NewStringUTF(
+            json.str().c_str());
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsv2_hsv2_1lite_MainActivity_startFixedRecording(
@@ -2083,12 +4464,28 @@ Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
         // START D455 IMU SENSOR SEPARATELY FROM RGB/DEPTH PIPELINE
         // --------------------------------------------------------------------
 
-        const bool imu_started =
-                startD455ImuSensor();
+        // TEMPORARY BASELINE TEST:
+        // RGB + Depth ON, D455 IMU OFF.
+        const bool imu_started = false;
 
         LOGI(
-                "D455 IMU start result: %s",
-                imu_started ? "SUCCESS" : "FAILED");
+                "D455 IMU start result: SKIPPED FOR RGB_DEPTH_BASELINE");
+
+        // --------------------------------------------------------------------
+        // QUERY D455 CAMERA <-> IMU CALIBRATION FOR VIO
+        // --------------------------------------------------------------------
+
+        if (imu_started) {
+            const bool vio_calibration_ok =
+                    queryD455VioCalibration(pipeline_profile);
+
+            LOGI(
+                    "D455 VIO calibration query result: %s",
+                    vio_calibration_ok ? "SUCCESS" : "FAILED");
+        } else {
+            LOGI(
+                    "D455 VIO calibration skipped: IMU startup failed");
+        }
 
         // --------------------------------------------------------------------
         // CACHE D455 CALIBRATION
@@ -2131,6 +4528,20 @@ Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
                             color_profile);
 
             calibration_ready = true;
+
+            // Initialize VIO using the actual D455 RGB camera intrinsics.
+            const bool vio_initialized =
+                    g_vio_engine.initialize(
+                            color_intrinsics.width,
+                            color_intrinsics.height,
+                            color_intrinsics.fx,
+                            color_intrinsics.fy,
+                            color_intrinsics.ppx,
+                            color_intrinsics.ppy);
+
+            LOGI(
+                    "VIO initialization: %s",
+                    vio_initialized ? "SUCCESS" : "FAILED");
 
             LOGI(
                     "D455 calibration ready: "
@@ -2215,30 +4626,199 @@ Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
                                 frames.get_depth_frame();
 
                         // -----------------------------------------------------
+                        // P3.1 GROUND PLANE
+                        // Estimate the ground plane from the current D455
+                        // depth frame. The latest valid plane is retained
+                        // through the configured fallback policy.
+                        // -----------------------------------------------------
+
+                        if (depth_frame) {
+
+                            const auto p31_start =
+                                    std::chrono::steady_clock::now();
+
+                            P31GroundPlane p31_result;
+
+                            const bool p31_valid =
+                                    runP31GroundPlane(
+                                            depth_frame,
+                                            p31_result);
+
+                            const auto p31_end =
+                                    std::chrono::steady_clock::now();
+
+                            const double p31_ms =
+                                    std::chrono::duration<
+                                            double,
+                                            std::milli>(
+                                            p31_end - p31_start)
+                                            .count();
+
+                            if (p31_valid) {
+
+                                LOGI(
+                                        "P31_GROUND: "
+                                        "valid=1 "
+                                        "fallback=%d "
+                                        "inliers=%d "
+                                        "samples=%d "
+                                        "error=%.4f m "
+                                        "plane=[%.4f %.4f %.4f %.4f] "
+                                        "time=%.2f ms",
+                                        p31_result.using_fallback ? 1 : 0,
+                                        p31_result.inliers,
+                                        p31_result.sampled_points,
+                                        p31_result.mean_error_m,
+                                        p31_result.nx,
+                                        p31_result.ny,
+                                        p31_result.nz,
+                                        p31_result.d,
+                                        p31_ms);
+
+                            } else {
+
+                                LOGI(
+                                        "P31_GROUND: "
+                                        "valid=0 "
+                                        "fallback=%d "
+                                        "inliers=%d "
+                                        "samples=%d "
+                                        "error=%.4f m "
+                                        "time=%.2f ms",
+                                        p31_result.using_fallback ? 1 : 0,
+                                        p31_result.inliers,
+                                        p31_result.sampled_points,
+                                        p31_result.mean_error_m,
+                                        p31_ms);
+                            }
+                        }
+
+                        // -----------------------------------------------------
+                        // ACTUAL VIO RGB INPUT
+                        // Feed the real D455 RGB frame and hardware timestamp
+                        // into the VIO engine.
+                        // -----------------------------------------------------
+
+                        if (color_frame &&
+                            g_vio_engine.isInitialized()) {
+
+                            const bool vio_image_ok =
+                                    g_vio_engine.addImage(
+                                            color_frame.get_timestamp(),
+                                            static_cast<const uint8_t*>(
+                                                    color_frame.get_data()),
+                                            color_frame.get_width(),
+                                            color_frame.get_height());
+
+                            if (currentStage == 4 && vio_image_ok) {
+
+                                const hsv2::VioTiming vio_timing =
+                                        g_vio_engine.getTiming();
+
+                                LOGI(
+                                        "VIO_INPUT: "
+                                        "frame=%llu "
+                                        "timestamp=%.3f "
+                                        "processing=%.3f ms "
+                                        "images=%llu "
+                                        "imu=%llu",
+                                        static_cast<unsigned long long>(
+                                                color_frame.get_frame_number()),
+                                        color_frame.get_timestamp(),
+                                        vio_timing.processing_ms,
+                                        static_cast<unsigned long long>(
+                                                vio_timing.image_count),
+                                        static_cast<unsigned long long>(
+                                                vio_timing.imu_count));
+                            }
+                        }
+
+                        // -----------------------------------------------------
                         // LADDER STAGE 4
                         // VIO-shaped concurrent CPU workload.
                         // Runs on a separate thread so it overlaps the normal
                         // D455 + MediaPipe processing pipeline.
                         // -----------------------------------------------------
 
-                        if (currentStage == 4 && color_frame) {
+                        if (currentStage == 4 &&
+                            color_frame &&
+                            depth_frame) {
 
-                            rs2::video_frame stage4_frame = color_frame;
+                            try {
 
-                            std::thread([stage4_frame]() {
+                                // -------------------------------------------------
+                                // Stage 4 - FAST PATH
+                                //
+                                // Do NOT run rs2::align here.
+                                // rs2::align is too expensive for the live 15 FPS path.
+                                // Stage 4 receives the native D455 depth frame directly.
+                                // -------------------------------------------------
+                                const rs2::depth_frame stage4_depth =
+                                        depth_frame;
 
-                                const Stage4Result stage4 =
-                                        run_stage4_vio_shaped_workload(
-                                                stage4_frame);
+                                if (!stage4_depth) {
 
-                                LOGI(
-                                        "STAGE4: "
-                                        "time=%.2f ms "
-                                        "checksum=%.6f",
-                                        stage4.processing_ms,
-                                        stage4.checksum);
+                                    LOGW(
+                                            "STAGE4_DYNAMIC: "
+                                            "native depth unavailable");
 
-                            }).detach();
+                                } else {
+
+                                    const Stage4DynamicResult stage4 =
+                                            g_stage4_dynamic_tracker.process(
+                                                    color_frame,
+                                                    stage4_depth);
+
+                                if (stage4.processed) {
+
+                                    LOGI(
+                                            "STAGE4_DYNAMIC: "
+                                            "frame=%llu "
+                                            "time=%.2f ms "
+                                            "features=%d "
+                                            "tracked=%d "
+                                            "inliers=%d "
+                                            "local3d=%d "
+                                            "pose=%d "
+                                            "pose_mode=%d "
+                                            "t=[%.4f %.4f %.4f]",
+                                            static_cast<unsigned long long>(
+                                                    color_frame.get_frame_number()),
+                                            stage4.processing_ms,
+                                            stage4.features,
+                                            stage4.tracked,
+                                            stage4.inliers,
+                                            stage4.local_points,
+                                            stage4.pose_valid ? 1 : 0,
+                                            stage4.pose_mode,
+                                            stage4.tx,
+                                            stage4.ty,
+                                            stage4.tz);
+
+                                } else {
+
+                                    LOGI(
+                                            "STAGE4_DYNAMIC: "
+                                            "frame=%llu "
+                                            "dropped_busy=1",
+                                            static_cast<unsigned long long>(
+                                                    color_frame.get_frame_number()));
+                                }
+
+                                }
+
+
+                            } catch (const std::exception& e) {
+
+                                LOGE(
+                                        "STAGE4_DYNAMIC exception: %s",
+                                        e.what());
+
+                            } catch (...) {
+
+                                LOGE(
+                                        "STAGE4_DYNAMIC unknown exception");
+                            }
                         }
 
                         // -----------------------------------------------------
@@ -2248,23 +4828,127 @@ Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
                         // the normal MediaPipe pipeline.
                         // -----------------------------------------------------
 
-                        if (currentStage == 2 && depth_frame) {
+                        if (currentStage == 2 &&
+                            color_frame &&
+                            depth_frame) {
 
-                            const Stage2Result stage2 =
-                                    run_stage2_voxel_workload(
-                                            depth_frame);
+                            try {
 
-                            LOGI(
-                                    "STAGE2: "
-                                    "time=%.2f ms "
-                                    "valid_points=%zu "
-                                    "voxels=%zu",
-                                    stage2.processing_ms,
-                                    stage2.valid_points,
-                                    stage2.voxel_count);
+                                // -------------------------------------------------
+                                // Stage 2.1 - Depth Alignment
+                                // Align depth into RGB/color coordinates.
+                                // -------------------------------------------------
+                                rs2::frameset aligned_frames =
+                                        stage2_align_to_color.process(frames);
+
+                                rs2::depth_frame aligned_depth =
+                                        aligned_frames.get_depth_frame();
+
+                                if (aligned_depth) {
+
+                                    const int aligned_width =
+                                            aligned_depth.get_width();
+
+                                    const int aligned_height =
+                                            aligned_depth.get_height();
+
+                                    rs2::video_stream_profile aligned_profile =
+                                            aligned_depth
+                                                    .get_profile()
+                                                    .as<rs2::video_stream_profile>();
+
+                                    const rs2_intrinsics aligned_intrinsics =
+                                            aligned_profile.get_intrinsics();
+
+                                    LOGI(
+                                            "STAGE2_ALIGN: "
+                                            "RGB=%dx%d "
+                                            "AlignedDepth=%dx%d",
+                                            color_frame.get_width(),
+                                            color_frame.get_height(),
+                                            aligned_width,
+                                            aligned_height);
+
+                                    // -------------------------------------------------
+                                    // Stage 2.2 -> 2.4
+                                    // 3D deprojection + decimation + voxel grid.
+                                    // -------------------------------------------------
+                                    Stage2Result stage2 =
+                                            run_stage2_voxel_workload(
+                                                    aligned_depth,
+                                                    aligned_intrinsics);
+
+                                    // -------------------------------------------------
+                                    // Stage 2.6 - RGB/3D frame association
+                                    // -------------------------------------------------
+                                    // The Stage 2 visualization snapshot is explicitly
+                                    // associated with this RGB/depth frameset.
+                                    stage2.rgb_frame_number =
+                                            static_cast<uint64_t>(
+                                                    color_frame.get_frame_number());
+
+                                    stage2.rgb_timestamp_ms =
+                                            color_frame.get_timestamp();
+
+                                    stage2.depth_frame_number =
+                                            static_cast<uint64_t>(
+                                                    aligned_depth.get_frame_number());
+
+                                    stage2.depth_timestamp_ms =
+                                            aligned_depth.get_timestamp();
+
+                                    const double stage2_time =
+                                            stage2.processing_ms;
+
+                                    const size_t stage2_points =
+                                            stage2.valid_points;
+
+                                    const size_t stage2_voxels =
+                                            stage2.voxel_count;
+
+                                    {
+                                        std::lock_guard<std::mutex> lock(
+                                                stage2_visualization_mutex);
+
+                                        latest_stage2_result =
+                                                std::move(stage2);
+
+                                        stage2_visualization_valid = true;
+                                    }
+
+                                    LOGI(
+                                            "STAGE2: "
+                                            "time=%.2f ms "
+                                            "valid_points=%zu "
+                                            "voxels=%zu "
+                                            "aligned=1",
+                                            stage2_time,
+                                            stage2_points,
+                                            stage2_voxels);
+
+                                } else {
+
+                                    LOGW(
+                                            "STAGE2_ALIGN: "
+                                            "aligned depth frame unavailable");
+                                }
+
+                            } catch (const rs2::error& e) {
+
+                                LOGE(
+                                        "STAGE2_ALIGN: "
+                                        "RealSense error: %s",
+                                        e.what());
+
+                            } catch (const std::exception& e) {
+
+                                LOGE(
+                                        "STAGE2_ALIGN: "
+                                        "Exception: %s",
+                                        e.what());
+                            }
                         }
 
-                        // -----------------------------------------------------
                         // COPY LATEST DEPTH FRAME
                         // -----------------------------------------------------
 
@@ -2815,49 +5499,108 @@ Java_com_hsv2_hsv2_1lite_MainActivity_startPipeline(
                                 // TELEMETRY
                                 // -------------------------------------------------
 
+                                std::ostringstream detections_stream;
+                                detections_stream << "[";
+
+                                {
+                                    std::lock_guard<std::mutex> fusion_lock(
+                                            fusion_detection_mutex);
+
+                                    for (size_t i = 0;
+                                         i < latest_fusion_detections.size();
+                                         ++i) {
+                                        const auto& detection =
+                                                latest_fusion_detections[i];
+
+                                        if (i > 0) {
+                                            detections_stream << ",";
+                                        }
+
+                                        detections_stream
+                                                << "{"
+                                                << "\"class\":\""
+                                                << detection.class_name
+                                                << "\","
+                                                << "\"score\":"
+                                                << detection.score
+                                                << ",\"distanceMeters\":"
+                                                << detection.distance_m
+                                                << ",\"xMeters\":"
+                                                << detection.x_m
+                                                << ",\"yMeters\":"
+                                                << detection.y_m
+                                                << ",\"zMeters\":"
+                                                << detection.z_m
+                                                << ",\"direction\":\""
+                                                << detection.direction
+                                                << "\","
+                                                << "\"horizontalDirection\":\""
+                                                << detection.horizontal_direction
+                                                << "\","
+                                                << "\"angleDegrees\":"
+                                                << detection.angle_deg
+                                                << ",\"depthValid\":"
+                                                << (detection.depth_valid ? "true" : "false")
+                                                << "}";
+                                    }
+                                }
+
+                                detections_stream << "]";
                                 std::string detections_json =
-                                        "[]";
+                                        detections_stream.str();
 
                                 std::lock_guard<std::mutex> lock(
                                         telemetry_mutex);
 
-                                snprintf(
+                                std::ostringstream telemetry_stream;
+                                telemetry_stream
+                                        << "{\"fps\": " << std::fixed << std::setprecision(1)
+                                        << current_fps.load()
+                                        << ", \"p50\": " << read_latency_p50()
+                                        << ", \"p95\": " << read_latency_p95()
+                                        << ", \"p99\": " << read_latency_p99()
+                                        << ", \"cpuClockMhz\": " << read_cpu_clock_max_mhz()
+                                        << ", \"thermal\": " << read_max_thermal_celsius()
+                                        << ", \"cpuThermalZones\": "
+                                        << read_cpu_thermal_zones_json()
+                                        << ", \"battery\": " << read_battery_percent()
+                                        << ", \"centerDistance\": " << std::setprecision(2)
+                                        << latency
+                                        << ", \"droppedFrames\": " << total_dropped_frames
+                                        << ", \"imu\": {"
+                                        << "\"gyro\": ["
+                                        << std::setprecision(5)
+                                        << latest_gyro_data.x << ", "
+                                        << latest_gyro_data.y << ", "
+                                        << latest_gyro_data.z << "], "
+                                        << "\"accel\": ["
+                                        << latest_accel_data.x << ", "
+                                        << latest_accel_data.y << ", "
+                                        << latest_accel_data.z << "], "
+                                        << "\"gyroTimestampMs\": "
+                                        << std::setprecision(3)
+                                        << latest_gyro_timestamp_ms
+                                        << ", \"accelTimestampMs\": "
+                                        << latest_accel_timestamp_ms
+                                        << ", \"gyroCount\": "
+                                        << static_cast<unsigned long long>(
+                                                imu_gyro_count.load())
+                                        << ", \"accelCount\": "
+                                        << static_cast<unsigned long long>(
+                                                imu_accel_count.load())
+                                        << "}, "
+                                        << "\"detections\": "
+                                        << detections_json
+                                        << "}";
+
+                                std::string telemetry_string =
+                                        telemetry_stream.str();
+
+                                std::snprintf(
                                         telemetry_json,
                                         sizeof(telemetry_json),
-
-                                        "{\"fps\": %.1f, "
-                                        "\"p50\": %.1f, "
-                                        "\"p95\": %.1f, "
-                                        "\"p99\": %.1f, "
-                                        "\"cpuClockMhz\": %.1f, "
-                                        "\"thermal\": %.1f, "
-                                        "\"cpuThermalZones\": %s, "
-                                        "\"battery\": %.1f, "
-                                        "\"centerDistance\": %.2f, "
-                                        "\"droppedFrames\": %d, "
-                                        "\"detections\": %s}",
-
-                                        current_fps.load(),
-
-                                        read_latency_p50(),
-                                        read_latency_p95(),
-                                        read_latency_p99(),
-
-                                        read_cpu_clock_max_mhz(),
-
-                                        read_max_thermal_celsius(),
-
-                                        read_cpu_thermal_zones_json().c_str(),
-
-                                        read_battery_percent(),
-
-                                        latency,
-
-                                        center_distance,
-
-                                        total_dropped_frames,
-
-                                        detections_json.c_str());
+                                        "%s",
+                                        telemetry_string.c_str());
 
                                 ANativeWindow_unlockAndPost(
                                         nativeWindow);
@@ -3036,6 +5779,31 @@ Java_com_hsv2_hsv2_1lite_MainActivity_stopPipeline(
 }
 
 // ============================================================================
+// SET STAGE 2 DECIMATION
+// ============================================================================
+
+extern "C" JNIEXPORT void JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_setStage2Decimation(
+        JNIEnv* env,
+        jobject /* this */,
+        jint decimation) {
+
+    if (decimation != 2 && decimation != 4) {
+        LOGW(
+                "Invalid Stage 2 decimation %d; keeping %d",
+                decimation,
+                stage2_decimation.load());
+        return;
+    }
+
+    stage2_decimation.store(decimation);
+
+    LOGI(
+            "Stage 2 decimation set to %d",
+            decimation);
+}
+
+// ============================================================================
 // SET STAGE
 // ============================================================================
 
@@ -3083,6 +5851,98 @@ Java_com_hsv2_hsv2_1lite_MainActivity_pollTelemetry(
 // ============================================================================
 // SET RGB NATIVE WINDOW
 // ============================================================================
+
+// ============================================================================
+// STAGE 2 VISUALIZATION SNAPSHOT
+// ============================================================================
+
+extern "C" JNIEXPORT jstring JNICALL
+Java_com_hsv2_hsv2_1lite_MainActivity_getStage2Visualization(
+        JNIEnv* env,
+        jobject /* this */) {
+
+    std::lock_guard<std::mutex> lock(
+            stage2_visualization_mutex);
+
+    if (!stage2_visualization_valid) {
+        return env->NewStringUTF("{}");
+    }
+
+    const Stage2Result& data =
+            latest_stage2_result;
+
+    std::ostringstream json;
+
+    json << std::fixed << std::setprecision(4);
+
+    json << "{";
+    json << "\"processingMs\":" << data.processing_ms << ",";
+    json << "\"validPoints\":" << data.valid_points << ",";
+    json << "\"voxelCount\":" << data.voxel_count << ",";
+    json << "\"decimation\":" << stage2_decimation.load() << ",";
+    json << "\"voxelSizeM\":0.0200,";
+
+    // Stage 2.6: RGB projection intrinsics.
+    // The Stage 2 depth is aligned to the RGB stream, so the
+    // aligned-depth coordinates use the RGB camera geometry.
+    json << "\"rgbWidth\":" << color_intrinsics.width << ",";
+    json << "\"rgbHeight\":" << color_intrinsics.height << ",";
+    json << "\"rgbFx\":" << color_intrinsics.fx << ",";
+    json << "\"rgbFy\":" << color_intrinsics.fy << ",";
+    json << "\"rgbCx\":" << color_intrinsics.ppx << ",";
+    json << "\"rgbCy\":" << color_intrinsics.ppy << ",";
+
+    // Stage 2.6 frame association metadata.
+    json << "\"rgbFrameNumber\":" << data.rgb_frame_number << ",";
+    json << "\"rgbTimestampMs\":" << data.rgb_timestamp_ms << ",";
+    json << "\"depthFrameNumber\":" << data.depth_frame_number << ",";
+    json << "\"depthTimestampMs\":" << data.depth_timestamp_ms << ",";
+
+    json << "\"points\":[";
+    for (size_t i = 0;
+         i < data.visualization_points.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const Stage2Point& point =
+                data.visualization_points[i];
+
+        json << "["
+             << point.x << ","
+             << point.y << ","
+             << point.z
+             << "]";
+    }
+    json << "],";
+
+    json << "\"voxels\":[";
+    for (size_t i = 0;
+         i < data.visualization_voxels.size();
+         ++i) {
+
+        if (i > 0) {
+            json << ",";
+        }
+
+        const Stage2Voxel& voxel =
+                data.visualization_voxels[i];
+
+        json << "["
+             << voxel.vx << ","
+             << voxel.vy << ","
+             << voxel.vz
+             << "]";
+    }
+    json << "]";
+
+    json << "}";
+
+    return env->NewStringUTF(
+            json.str().c_str());
+}
 
 extern "C" JNIEXPORT void JNICALL
 Java_com_hsv2_hsv2_1lite_MainActivity_setNativeWindow(

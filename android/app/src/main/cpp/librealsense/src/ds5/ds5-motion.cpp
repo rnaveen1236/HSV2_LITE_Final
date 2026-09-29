@@ -21,6 +21,20 @@
 using namespace librealsense;
 namespace librealsense
 {
+    bool ds5_motion::get_vio_depth_to_imu_extrinsics(rs2_extrinsics& out) const
+    {
+        if (!_depth_to_imu)
+            return false;
+
+        out = **_depth_to_imu;
+        return true;
+    }
+
+namespace
+{
+    ds5_motion* g_active_d455_vio_instance = nullptr;
+}
+
     const std::map<uint32_t, rs2_format> fisheye_fourcc_to_rs2_format = {
         {rs_fourcc('R','A','W','8'), RS2_FORMAT_RAW8},
         {rs_fourcc('G','R','E','Y'), RS2_FORMAT_RAW8},
@@ -167,6 +181,65 @@ namespace librealsense
         throw std::runtime_error(to_string() << "Motion Intrinsics unknown for stream " << rs2_stream_to_string(stream) << "!");
     }
 
+    bool ds5_motion::get_vio_extrinsics(
+        rs2_extrinsics* color_to_accel,
+        rs2_extrinsics* color_to_gyro) const
+    {
+        LOG_ERROR(
+            "VIO POINTER CHECK: color="
+            << (_color_stream ? "VALID" : "NULL")
+            << " depth="
+            << (_depth_stream ? "VALID" : "NULL")
+            << " accel="
+            << (_accel_stream ? "VALID" : "NULL")
+            << " gyro="
+            << (_gyro_stream ? "VALID" : "NULL")
+            << " out_accel="
+            << (color_to_accel ? "VALID" : "NULL")
+            << " out_gyro="
+            << (color_to_gyro ? "VALID" : "NULL"));
+
+        if (!color_to_accel || !color_to_gyro ||
+            !_color_stream || !_depth_stream ||
+            !_accel_stream || !_gyro_stream)
+        {
+            LOG_ERROR("VIO EXTRINSICS: required pointer is NULL");
+            return false;
+        }
+
+        auto graph_lock =
+            environment::get_instance().get_extrinsics_graph().lock();
+
+        const bool color_to_accel_ok =
+            environment::get_instance()
+                .get_extrinsics_graph()
+                .try_fetch_extrinsics(
+                    *_color_stream,
+                    *_accel_stream,
+                    color_to_accel);
+
+        const bool color_to_gyro_ok =
+            environment::get_instance()
+                .get_extrinsics_graph()
+                .try_fetch_extrinsics(
+                    *_color_stream,
+                    *_gyro_stream,
+                    color_to_gyro);
+
+        LOG_ERROR(
+            "VIO EXTRINSICS GRAPH: color_to_accel="
+            << (color_to_accel_ok ? "SUCCESS" : "FAILED")
+            << " color_to_gyro="
+            << (color_to_gyro_ok ? "SUCCESS" : "FAILED"));
+
+        return color_to_accel_ok && color_to_gyro_ok;
+    }
+
+    ds5_motion* ds5_motion::get_active_vio_instance()
+    {
+        return g_active_d455_vio_instance;
+    }
+
     std::shared_ptr<synthetic_sensor> ds5_motion::create_hid_device(std::shared_ptr<context> ctx,
                                                                 const std::vector<platform::hid_device_info>& all_hid_infos,
                                                                 const firmware_version& camera_fw_version)
@@ -310,6 +383,8 @@ namespace librealsense
           _accel_stream(new stream(RS2_STREAM_ACCEL)),
           _gyro_stream(new stream(RS2_STREAM_GYRO))
     {
+        g_active_d455_vio_instance = this;
+
         using namespace ds;
 
         std::vector<platform::hid_device_info> hid_infos = group.hid_devices;

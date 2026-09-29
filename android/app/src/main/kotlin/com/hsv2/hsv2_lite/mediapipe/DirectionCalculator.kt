@@ -41,4 +41,15 @@ class DirectionCalculator {
             else -> "9 o'clock"
         }
     }
+
+    fun angleToHorizontalDirection(
+        angleDegrees: Float
+    ): String {
+
+        return when {
+            angleDegrees < -15f -> "LEFT"
+            angleDegrees > 15f -> "RIGHT"
+            else -> "CENTER"
+        }
+    }
 }

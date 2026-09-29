@@ -27,6 +27,18 @@ class TelemetryData {
   final double usbTransportLatencyMs;
   final double centerDistanceMeters;
 
+  // Live D455 IMU telemetry
+  final double gyroX;
+  final double gyroY;
+  final double gyroZ;
+  final double accelX;
+  final double accelY;
+  final double accelZ;
+  final double gyroTimestampMs;
+  final double accelTimestampMs;
+  final int gyroCount;
+  final int accelCount;
+
   TelemetryData({
     this.fps = 0.0,
     this.p50LatencyMs = 0.0,
@@ -39,6 +51,16 @@ class TelemetryData {
     this.droppedFrames = 0,
     this.usbTransportLatencyMs = 0.0,
     this.centerDistanceMeters = 0.0,
+    this.gyroX = 0.0,
+    this.gyroY = 0.0,
+    this.gyroZ = 0.0,
+    this.accelX = 0.0,
+    this.accelY = 0.0,
+    this.accelZ = 0.0,
+    this.gyroTimestampMs = 0.0,
+    this.accelTimestampMs = 0.0,
+    this.gyroCount = 0,
+    this.accelCount = 0,
   });
 }
 
